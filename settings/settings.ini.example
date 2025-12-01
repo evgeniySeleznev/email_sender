@@ -1,0 +1,50 @@
+[ORACLE]
+Instance = your_instance
+
+[main]
+username = your_username
+password = your_password
+dsn = your_dsn
+
+[queue]
+queue_name = askaq.aq_ask
+consumer_name = SUB_EMAIL_SENDER
+
+[SMTP]
+Host = smtp.example.com
+Port = 25
+User = your_email@example.com
+Password = your_password
+DisplayName = Your Display Name
+EnableSSL = True
+MinSendIntervalMsec = 1000
+SMTPMinSendEmailIntervalMsec = 1000
+POPHost = pop.example.com
+POPPort = 995
+
+#[SMTP1]
+#Host = smtp.example.com
+#Port = 25
+#User = your_email@example.com
+#Password = your_password
+#DisplayName = Your Display Name
+#EnableSSL = True
+#MinSendIntervalMsec = 1000
+#SMTPMinSendEmailIntervalMsec = 1000
+#POPHost = pop.example.com
+#POPPort = 995
+
+[Mode]
+Debug = False
+SendHiddenCopyToSelf = False
+IsBodyHTML = False
+MaxErrorCountForAutoRestart = 50
+
+[Schedule]
+TimeStart = 08:00
+TimeEnd = 21:00
+
+[Log]
+LogLevel = 4
+MaxArchiveFiles = 10
+
