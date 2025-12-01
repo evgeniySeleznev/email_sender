@@ -1,0 +1,136 @@
+package email
+
+import (
+	"context"
+	"fmt"
+	"sync"
+	"time"
+
+	"go.uber.org/zap"
+
+	"email-service/db"
+	"email-service/logger"
+	"email-service/settings"
+)
+
+// Service представляет email сервис
+type Service struct {
+	cfg                *settings.Config
+	dbConn             *db.DBConnection
+	smtpClients        []*SMTPClient
+	attachmentProcessor *AttachmentProcessor
+	testEmail          string
+	testEmailCacheTime time.Time
+	testEmailMu        sync.RWMutex
+	testEmailCacheTTL  time.Duration
+}
+
+// NewService создает новый email сервис
+func NewService(cfg *settings.Config, dbConn *db.DBConnection) (*Service, error) {
+	// Создаем SMTP клиенты для каждого SMTP сервера
+	smtpClients := make([]*SMTPClient, 0, len(cfg.SMTP))
+	for i := range cfg.SMTP {
+		client := NewSMTPClient(&cfg.SMTP[i])
+		smtpClients = append(smtpClients, client)
+	}
+
+	return &Service{
+		cfg:                cfg,
+		dbConn:             dbConn,
+		smtpClients:        smtpClients,
+		attachmentProcessor: NewAttachmentProcessor(dbConn),
+		testEmailCacheTTL:  5 * time.Minute, // Кеш тестового email на 5 минут
+	}, nil
+}
+
+// Close закрывает сервис
+func (s *Service) Close() error {
+	// SMTP клиенты не требуют явного закрытия (используют стандартный net/smtp)
+	// POP3 клиенты создаются по требованию и закрываются автоматически
+	if logger.Log != nil {
+		logger.Log.Info("Email сервис закрыт")
+	}
+	return nil
+}
+
+// SendEmail отправляет email
+func (s *Service) SendEmail(ctx context.Context, msg *EmailMessage) error {
+	// Получаем тестовый email, если включен Debug режим
+	var testEmail string
+	if s.cfg.Mode.Debug {
+		testEmail = s.getTestEmail(ctx)
+		if testEmail == "" {
+			if logger.Log != nil {
+				logger.Log.Warn("Debug режим включен, но тестовый email не получен, используем оригинальный адрес",
+					zap.Int64("taskID", msg.TaskID))
+			}
+		}
+	}
+
+	// Выбираем SMTP клиент по SmtpID (индекс в массиве)
+	smtpIndex := msg.SmtpID
+	if smtpIndex < 0 || smtpIndex >= len(s.smtpClients) {
+		smtpIndex = 0 // Используем первый SMTP сервер по умолчанию
+	}
+
+	smtpClient := s.smtpClients[smtpIndex]
+
+	// Отправляем email с параметрами из конфигурации
+	if err := smtpClient.SendEmail(ctx, msg, testEmail, s.cfg.Mode.IsBodyHTML, s.cfg.Mode.SendHiddenCopyToSelf); err != nil {
+		return fmt.Errorf("ошибка отправки через SMTP: %w", err)
+	}
+
+	return nil
+}
+
+// getTestEmail получает тестовый email из БД с кешированием
+func (s *Service) getTestEmail(ctx context.Context) string {
+	s.testEmailMu.RLock()
+	// Проверяем кеш
+	if s.testEmail != "" && time.Since(s.testEmailCacheTime) < s.testEmailCacheTTL {
+		cachedEmail := s.testEmail
+		s.testEmailMu.RUnlock()
+		return cachedEmail
+	}
+	s.testEmailMu.RUnlock()
+
+	// Получаем тестовый email из БД
+	testEmail, err := s.dbConn.GetTestEmail()
+	if err != nil {
+		if logger.Log != nil {
+			logger.Log.Warn("Ошибка получения тестового email из БД",
+				zap.Error(err))
+		}
+		return ""
+	}
+
+	// Обновляем кеш
+	s.testEmailMu.Lock()
+	s.testEmail = testEmail
+	s.testEmailCacheTime = time.Now()
+	s.testEmailMu.Unlock()
+
+	return testEmail
+}
+
+// ProcessAttachment обрабатывает вложение и возвращает данные для отправки
+func (s *Service) ProcessAttachment(ctx context.Context, attach *Attachment, taskID int64) (*AttachmentData, error) {
+	return s.attachmentProcessor.ProcessAttachment(ctx, attach, taskID)
+}
+
+// EmailMessage представляет email сообщение для отправки
+type EmailMessage struct {
+	TaskID       int64
+	SmtpID       int
+	EmailAddress string
+	Title        string
+	Text         string
+	Attachments  []AttachmentData
+}
+
+// AttachmentData представляет данные вложения
+type AttachmentData struct {
+	FileName string
+	Data     []byte
+}
+

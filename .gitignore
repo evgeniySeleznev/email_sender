@@ -1,0 +1,48 @@
+# Чувствительные конфигурационные файлы
+settings/settings.ini
+*.ini
+config.ini
+
+# Скомпилированные бинарники
+email-service
+email-service.exe
+email-service.darwin
+email-service.linux
+email-service.windows
+*.exe
+main
+
+# Логи
+logs/
+*.log
+*.log.*
+
+# Переменные окружения
+.env
+.env.local
+.env.*.local
+
+# Временные файлы
+*.tmp
+*.temp
+*.swp
+*.swo
+*~
+.DS_Store
+
+# IDE файлы
+.idea/
+.vscode/
+*.iml
+
+# Go специфичные
+# Но оставляем go.mod и go.sum, так как они нужны для зависимостей
+
+# Тестовые файлы с данными
+test_data/
+*.test
+
+# Backup файлы
+*.bak
+*.backup
+
