@@ -646,7 +646,16 @@ func (s *Service) loadDeliveryStatuses(ctx context.Context) {
 		sourceEmail := smtpCfg.User
 
 		// Обрабатываем статусы доставки
+		logger.Log.Info("Начало проверки статусов доставки через POP3",
+			zap.Int("smtpIndex", i),
+			zap.String("popHost", smtpCfg.POPHost),
+			zap.String("sourceEmail", sourceEmail))
+
 		err := pop3Client.GetMessagesStatus(ctx, sourceEmail, func(taskID int64, status int, statusDesc string) {
+			logger.Log.Info("Обработка DSN статуса",
+				zap.Int64("taskID", taskID),
+				zap.Int("status", status),
+				zap.String("description", statusDesc))
 			// Сохраняем статус в очередь результатов
 			s.enqueueResponse(taskID, status, statusDesc)
 		})
@@ -656,6 +665,10 @@ func (s *Service) loadDeliveryStatuses(ctx context.Context) {
 				zap.Int("smtpIndex", i),
 				zap.String("popHost", smtpCfg.POPHost),
 				zap.Error(err))
+		} else {
+			logger.Log.Info("Проверка статусов доставки завершена успешно",
+				zap.Int("smtpIndex", i),
+				zap.String("popHost", smtpCfg.POPHost))
 		}
 	}
 }

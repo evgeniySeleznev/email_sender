@@ -72,6 +72,11 @@ func (c *POP3Client) GetMessagesStatus(ctx context.Context, sourceEmail string, 
 		return fmt.Errorf("ошибка получения статуса POP3: %w", err)
 	}
 
+	logger.Log.Info("Количество сообщений в POP3 ящике",
+		zap.String("popHost", c.cfg.POPHost),
+		zap.Int("totalMessages", total),
+		zap.Time("lastStatusTime", c.lastStatusTime))
+
 	processed := 0
 
 	// Обрабатываем сообщения с конца (новые сначала)
@@ -187,10 +192,11 @@ func (c *POP3Client) GetMessagesStatus(ctx context.Context, sourceEmail string, 
 done:
 	c.lastStatusTime = startTime
 
-	logger.Log.Info("Получено статусов доставки",
+	logger.Log.Info("Завершена проверка статусов доставки",
 		zap.String("popHost", c.cfg.POPHost),
-		zap.Int("processed", processed),
-		zap.Int("total", total))
+		zap.Int("processedDSN", processed),
+		zap.Int("totalMessages", total),
+		zap.Duration("duration", time.Since(startTime)))
 
 	return nil
 }
