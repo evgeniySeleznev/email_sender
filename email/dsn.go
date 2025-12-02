@@ -163,11 +163,44 @@ func parseDSNBody(sourceEmail string, body []byte) (taskID int64, status int, st
 	if envelopeID == "" {
 		envelopeID = extractHeaderValue(bodyStr, "X-Envelope-ID")
 	}
+	// Также пробуем найти в заголовках сообщения (не только в DSN части)
+	if envelopeID == "" {
+		// Ищем в начале тела (может быть в заголовках)
+		lines := strings.Split(bodyStr, "\n")
+		for _, line := range lines {
+			line = strings.TrimSpace(line)
+			if strings.HasPrefix(strings.ToLower(line), "x-envelope-id:") {
+				parts := strings.SplitN(line, ":", 2)
+				if len(parts) == 2 {
+					envelopeID = strings.TrimSpace(parts[1])
+					break
+				}
+			}
+			if strings.HasPrefix(strings.ToLower(line), "original-envelope-id:") {
+				parts := strings.SplitN(line, ":", 2)
+				if len(parts) == 2 {
+					envelopeID = strings.TrimSpace(parts[1])
+					break
+				}
+			}
+		}
+	}
 	if envelopeID == "" {
 		if logger.Log != nil {
-			logger.Log.Debug("DSN сообщение не содержит Original-Envelope-Id или X-Envelope-ID")
+			bodyPreview := bodyStr
+			if len(bodyStr) > 500 {
+				bodyPreview = bodyStr[:500] + "..."
+			}
+			logger.Log.Info("DSN сообщение не содержит Original-Envelope-Id или X-Envelope-ID",
+				zap.String("bodyPreview", bodyPreview),
+				zap.Int("bodyLength", len(bodyStr)))
 		}
 		return 0, 0, ""
+	}
+
+	if logger.Log != nil {
+		logger.Log.Debug("Найден envelope ID в DSN",
+			zap.String("envelopeID", envelopeID))
 	}
 
 	// Проверяем, что это наш envelope ID

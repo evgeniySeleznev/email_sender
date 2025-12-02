@@ -140,11 +140,47 @@ func (c *POP3Client) GetMessagesStatus(ctx context.Context, sourceEmail string, 
 			if err := client.deleteMsgId(i); err != nil {
 				logger.Log.Warn("Ошибка удаления сообщения", zap.Int("index", i), zap.Error(err))
 			}
-		} else if taskID == 0 && status == 0 {
-			// Логируем, если это не DSN сообщение (для отладки)
-			logger.Log.Debug("Сообщение не является DSN или не содержит наш envelope ID",
-				zap.Int("index", i),
-				zap.Int("partsCount", len(msg.Parts)))
+		} else {
+			// Логируем подробную информацию о сообщении для диагностики
+			bodyPreview := ""
+			if len(msg.Body) > 0 {
+				bodyStr := string(msg.Body)
+				if len(bodyStr) > 500 {
+					bodyPreview = bodyStr[:500] + "..."
+				} else {
+					bodyPreview = bodyStr
+				}
+			}
+
+			// Проверяем, содержит ли сообщение ключевые слова DSN
+			isDSNCandidate := false
+			if len(msg.Body) > 0 {
+				bodyStr := string(msg.Body)
+				isDSNCandidate = strings.Contains(bodyStr, "delivery-status") ||
+					strings.Contains(bodyStr, "Original-Envelope-Id") ||
+					strings.Contains(bodyStr, "X-Envelope-ID") ||
+					strings.Contains(bodyStr, "askemailsender")
+			}
+
+			for _, part := range msg.Parts {
+				if strings.Contains(part.ContentType, "delivery-status") {
+					isDSNCandidate = true
+					break
+				}
+			}
+
+			if isDSNCandidate {
+				logger.Log.Info("Найдено потенциальное DSN сообщение, но оно не было обработано",
+					zap.Int("index", i),
+					zap.Int("partsCount", len(msg.Parts)),
+					zap.String("bodyPreview", bodyPreview),
+					zap.Int64("taskID", taskID),
+					zap.Int("status", status))
+			} else {
+				logger.Log.Debug("Сообщение не является DSN",
+					zap.Int("index", i),
+					zap.Int("partsCount", len(msg.Parts)))
+			}
 		}
 	}
 
@@ -219,12 +255,32 @@ func (c *pop3Client) connect(ctx context.Context) error {
 func (c *pop3Client) auth() error {
 	// USER команда
 	if err := c.command("USER %s", c.user); err != nil {
-		return err
+		return fmt.Errorf("ошибка отправки команды USER: %w", err)
+	}
+
+	// Читаем ответ на USER
+	line, err := c.reader.ReadString('\n')
+	if err != nil {
+		return fmt.Errorf("ошибка чтения ответа на USER: %w", err)
+	}
+	line = strings.TrimSpace(line)
+	if !strings.HasPrefix(line, "+OK") {
+		return fmt.Errorf("ошибка аутентификации USER: %s", line)
 	}
 
 	// PASS команда
 	if err := c.command("PASS %s", c.pass); err != nil {
-		return err
+		return fmt.Errorf("ошибка отправки команды PASS: %w", err)
+	}
+
+	// Читаем ответ на PASS
+	line, err = c.reader.ReadString('\n')
+	if err != nil {
+		return fmt.Errorf("ошибка чтения ответа на PASS: %w", err)
+	}
+	line = strings.TrimSpace(line)
+	if !strings.HasPrefix(line, "+OK") {
+		return fmt.Errorf("ошибка аутентификации PASS: %s", line)
 	}
 
 	return nil
@@ -234,18 +290,23 @@ func (c *pop3Client) auth() error {
 func (c *pop3Client) stat() (int, error) {
 	line, err := c.commandRead("STAT")
 	if err != nil {
-		return 0, err
+		return 0, fmt.Errorf("ошибка чтения ответа STAT: %w", err)
+	}
+
+	// Проверяем, что ответ начинается с +OK
+	if !strings.HasPrefix(line, "+OK") {
+		return 0, fmt.Errorf("сервер вернул ошибку на команду STAT: %s", line)
 	}
 
 	// Формат: +OK count size
 	parts := strings.Fields(line)
 	if len(parts) < 2 {
-		return 0, fmt.Errorf("неверный формат ответа STAT: %s", line)
+		return 0, fmt.Errorf("неверный формат ответа STAT (ожидается '+OK count size'): %s", line)
 	}
 
 	count, err := strconv.Atoi(parts[1])
 	if err != nil {
-		return 0, fmt.Errorf("ошибка парсинга количества сообщений: %w", err)
+		return 0, fmt.Errorf("ошибка парсинга количества сообщений из '%s': %w", line, err)
 	}
 
 	return count, nil
