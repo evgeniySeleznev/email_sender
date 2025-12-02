@@ -64,7 +64,7 @@ func NewService(cfg *settings.Config, dbConn *db.DBConnection, queueReader *db.Q
 		responseQueue:    make(chan db.SaveEmailResponseParams, 10000), // Буферизованный канал
 		sendEmailMap:     make(map[string]time.Time),
 		nextDequeueAll:   time.Now(),                       // Сразу при запуске
-		nextLoadStatuses: time.Now().Add(60 * time.Minute), // Через 60 минут
+		nextLoadStatuses: time.Now().Add(15 * time.Second), // Первая проверка через 2 минуты после запуска
 	}
 
 	// Запускаем горутину для записи результатов в БД
@@ -628,7 +628,7 @@ func (s *Service) shouldLoadStatuses() bool {
 	}
 
 	if time.Now().After(s.nextLoadStatuses) {
-		s.nextLoadStatuses = time.Now().Add(15 * time.Second)
+		s.nextLoadStatuses = time.Now().Add(30 * time.Second) // Следующая проверка через 1 минуту
 		return true
 	}
 	return false
