@@ -139,10 +139,39 @@ func (c *SMTPClient) parseEmailAddresses(emailAddresses string, testEmail string
 	return result
 }
 
+// encodeHeader кодирует заголовок по RFC 2047 для не-ASCII символов
+func encodeHeader(text string) string {
+	if text == "" {
+		return text
+	}
+	
+	// Проверяем, есть ли не-ASCII символы
+	needsEncoding := false
+	for _, r := range text {
+		if r > 127 {
+			needsEncoding = true
+			break
+		}
+	}
+	
+	if !needsEncoding {
+		return text
+	}
+	
+	// Используем Q-encoding для заголовков (RFC 2047)
+	return mime.QEncoding.Encode("UTF-8", text)
+}
+
 // buildEmailMessage формирует тело email сообщения с поддержкой вложений
 func (c *SMTPClient) buildEmailMessage(msg *EmailMessage, recipientEmails []string, isBodyHTML bool, sendHiddenCopyToSelf bool) string {
 	// Формируем основные заголовки
-	headers := fmt.Sprintf("From: %s <%s>\r\n", c.cfg.DisplayName, c.cfg.User)
+	// Кодируем DisplayName если он не пустой
+	fromHeader := c.cfg.User
+	if c.cfg.DisplayName != "" {
+		encodedDisplayName := encodeHeader(c.cfg.DisplayName)
+		fromHeader = fmt.Sprintf("%s <%s>", encodedDisplayName, c.cfg.User)
+	}
+	headers := fmt.Sprintf("From: %s\r\n", fromHeader)
 
 	// To: адреса
 	toHeader := strings.Join(recipientEmails, ", ")
@@ -153,7 +182,13 @@ func (c *SMTPClient) buildEmailMessage(msg *EmailMessage, recipientEmails []stri
 		headers += fmt.Sprintf("Bcc: %s\r\n", c.cfg.User)
 	}
 
-	headers += fmt.Sprintf("Subject: %s\r\n", msg.Title)
+	// Кодируем Subject если он не пустой
+	subject := msg.Title
+	if subject == "" {
+		subject = "(без темы)" // Значение по умолчанию
+	}
+	encodedSubject := encodeHeader(subject)
+	headers += fmt.Sprintf("Subject: %s\r\n", encodedSubject)
 	headers += fmt.Sprintf("Message-ID: <%s@%s>\r\n", fmt.Sprintf("askemailsender%d", msg.TaskID), c.cfg.Host)
 	headers += fmt.Sprintf("X-Envelope-ID: askemailsender%d\r\n", msg.TaskID) // Для DSN
 	headers += "MIME-Version: 1.0\r\n"
