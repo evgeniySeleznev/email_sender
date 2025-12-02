@@ -28,7 +28,7 @@ type QueueReader struct {
 	dbConn       *DBConnection
 	queueName    string
 	consumerName string
-	waitTimeout  int // в миллисекундах
+	waitTimeout  int // в секундах
 	mu           sync.Mutex
 }
 
@@ -58,7 +58,7 @@ func NewQueueReader(dbConn *DBConnection) (*QueueReader, error) {
 		dbConn:       dbConn,
 		queueName:    queueName,
 		consumerName: consumerName,
-		waitTimeout:  50, // 50 миллисекунд по умолчанию
+		waitTimeout:  2, // 2 секунды по умолчанию
 	}, nil
 }
 
@@ -112,9 +112,11 @@ func (qr *QueueReader) DequeueMany(ctx context.Context, count int) ([]*QueueMess
 		// Для первого сообщения используем полный timeout, для остальных - минимальный
 		var timeout float64
 		if i == 0 {
-			timeout = float64(qr.waitTimeout) / 1000.0 // Конвертируем миллисекунды в секунды
+			timeout = float64(qr.waitTimeout)
 		} else {
-			timeout = 0.05 // 50 миллисекунд для последующих сообщений
+			// Для последующих сообщений используем минимальный timeout (50 миллисекунд = 0.05 секунды)
+			// чтобы быстро определить, что очередь пуста
+			timeout = 0.05
 		}
 
 		msg, err := qr.dequeueOneMessageWithTimeout(ctx, timeout)
@@ -429,11 +431,11 @@ func (qr *QueueReader) ParseXMLMessage(msg *QueueMessage) (map[string]interface{
 
 	// Парсим внутренний XML из body
 	type EmailData struct {
-		EmailTaskID    string `xml:"email_task_id,attr"`
-		SmtpID         string `xml:"smtp_id,attr"`
-		EmailAddress   string `xml:"email_address,attr"`
-		EmailTitle     string `xml:"email_title,attr"`
-		EmailText      string `xml:"email_text,attr"`
+		EmailTaskID     string `xml:"email_task_id,attr"`
+		SmtpID          string `xml:"smtp_id,attr"`
+		EmailAddress    string `xml:"email_address,attr"`
+		EmailTitle      string `xml:"email_title,attr"`
+		EmailText       string `xml:"email_text,attr"`
 		SendingSchedule string `xml:"sending_schedule,attr"`
 	}
 
@@ -457,11 +459,11 @@ func (qr *QueueReader) ParseXMLMessage(msg *QueueMessage) (map[string]interface{
 		"dequeue_time":     msg.DequeueTime,
 		"date_active_from": root.Head.DateActiveFrom,
 		"email_task_id":    emailData.EmailTaskID,
-		"smtp_id":           emailData.SmtpID,
-		"email_address":     emailData.EmailAddress,
-		"email_title":       emailData.EmailTitle,
-		"email_text":        emailData.EmailText,
-		"sending_schedule":  emailData.SendingSchedule,
+		"smtp_id":          emailData.SmtpID,
+		"email_address":    emailData.EmailAddress,
+		"email_title":      emailData.EmailTitle,
+		"email_text":       emailData.EmailText,
+		"sending_schedule": emailData.SendingSchedule,
 	}
 
 	return result, nil
@@ -513,10 +515,9 @@ func (qr *QueueReader) GetConsumerName() string {
 	return qr.consumerName
 }
 
-// SetWaitTimeout устанавливает таймаут ожидания сообщений (в миллисекундах)
-func (qr *QueueReader) SetWaitTimeout(milliseconds int) {
+// SetWaitTimeout устанавливает таймаут ожидания сообщений (в секундах)
+func (qr *QueueReader) SetWaitTimeout(seconds int) {
 	qr.mu.Lock()
 	defer qr.mu.Unlock()
-	qr.waitTimeout = milliseconds
+	qr.waitTimeout = seconds
 }
-

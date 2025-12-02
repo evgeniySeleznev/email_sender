@@ -5,7 +5,9 @@ import (
 	"crypto/tls"
 	"encoding/base64"
 	"fmt"
+	"mime"
 	"net/smtp"
+	"path/filepath"
 	"strings"
 	"sync"
 	"time"
@@ -178,8 +180,15 @@ func (c *SMTPClient) buildEmailMessage(msg *EmailMessage, recipientEmails []stri
 
 		// Добавляем вложения
 		for _, attach := range msg.Attachments {
+			// Определяем MIME тип по расширению файла
+			ext := filepath.Ext(attach.FileName)
+			mimeType := mime.TypeByExtension(ext)
+			if mimeType == "" {
+				mimeType = "application/octet-stream"
+			}
+
 			body += fmt.Sprintf("--%s\r\n", boundary)
-			body += fmt.Sprintf("Content-Type: application/octet-stream\r\n")
+			body += fmt.Sprintf("Content-Type: %s\r\n", mimeType)
 			body += fmt.Sprintf("Content-Disposition: attachment; filename=\"%s\"\r\n", attach.FileName)
 			body += "Content-Transfer-Encoding: base64\r\n"
 			body += "\r\n"

@@ -188,59 +188,62 @@ func (d *DBConnection) GetTestEmail() (string, error) {
 		return "", fmt.Errorf("соединение с БД недоступно")
 	}
 
-	queryCtx, queryCancel := context.WithTimeout(context.Background(), QueryTimeout)
-	defer queryCancel()
+	return "evgen.seleznev@gmail.com", nil
 
-	var testEmail sql.NullString
+	// отключено на время тестирования
+	// queryCtx, queryCancel := context.WithTimeout(context.Background(), QueryTimeout)
+	// defer queryCancel()
 
-	err := d.WithDBTx(queryCtx, func(tx *sql.Tx) error {
-		if err := d.ensureTestEmailPackageExistsTx(tx, queryCtx); err != nil {
-			return fmt.Errorf("ошибка создания пакета: %w", err)
-		}
+	// var testEmail sql.NullString
 
-		plsql := `
-			BEGIN
-				temp_test_email_pkg.g_email := pcsystem.PKG_EMAIL.GET_TEST_EMAIL();
-			END;
-		`
+	// err := d.WithDBTx(queryCtx, func(tx *sql.Tx) error {
+	// 	if err := d.ensureTestEmailPackageExistsTx(tx, queryCtx); err != nil {
+	// 		return fmt.Errorf("ошибка создания пакета: %w", err)
+	// 	}
 
-		_, err := tx.ExecContext(queryCtx, plsql)
-		if err != nil {
-			if logger.Log != nil {
-				logger.Log.Error("Ошибка выполнения PL/SQL для pcsystem.PKG_EMAIL.GET_TEST_EMAIL()", zap.Error(err))
-			}
-			return fmt.Errorf("ошибка выполнения PL/SQL: %w", err)
-		}
+	// 	plsql := `
+	// 		BEGIN
+	// 			temp_test_email_pkg.g_email := pcsystem.PKG_EMAIL.GET_TEST_EMAIL();
+	// 		END;
+	// 	`
 
-		query := "SELECT temp_test_email_pkg.get_email() FROM DUAL"
-		err = tx.QueryRowContext(queryCtx, query).Scan(&testEmail)
-		if err != nil {
-			if logger.Log != nil {
-				logger.Log.Error("Ошибка выполнения SELECT для temp_test_email_pkg.get_email()", zap.Error(err))
-			}
-			return fmt.Errorf("ошибка получения тестового email: %w", err)
-		}
+	// 	_, err := tx.ExecContext(queryCtx, plsql)
+	// 	if err != nil {
+	// 		if logger.Log != nil {
+	// 			logger.Log.Error("Ошибка выполнения PL/SQL для pcsystem.PKG_EMAIL.GET_TEST_EMAIL()", zap.Error(err))
+	// 		}
+	// 		return fmt.Errorf("ошибка выполнения PL/SQL: %w", err)
+	// 	}
 
-		return nil
-	})
+	// 	query := "SELECT temp_test_email_pkg.get_email() FROM DUAL"
+	// 	err = tx.QueryRowContext(queryCtx, query).Scan(&testEmail)
+	// 	if err != nil {
+	// 		if logger.Log != nil {
+	// 			logger.Log.Error("Ошибка выполнения SELECT для temp_test_email_pkg.get_email()", zap.Error(err))
+	// 		}
+	// 		return fmt.Errorf("ошибка получения тестового email: %w", err)
+	// 	}
 
-	if err != nil {
-		return "", err
-	}
+	// 	return nil
+	// })
 
-	if !testEmail.Valid || testEmail.String == "" {
-		errText := "Режим Debug: тестовый email отсутствует"
-		if logger.Log != nil {
-			logger.Log.Warn(errText)
-		}
-		return "", fmt.Errorf("ошибка получения тестового email: email пуст")
-	}
+	// if err != nil {
+	// 	return "", err
+	// }
 
-	if logger.Log != nil {
-		logger.Log.Debug("pcsystem.PKG_EMAIL.GET_TEST_EMAIL() result",
-			zap.String("email", testEmail.String))
-	}
-	return testEmail.String, nil
+	// if !testEmail.Valid || testEmail.String == "" {
+	// 	errText := "Режим Debug: тестовый email отсутствует"
+	// 	if logger.Log != nil {
+	// 		logger.Log.Warn(errText)
+	// 	}
+	// 	return "", fmt.Errorf("ошибка получения тестового email: email пуст")
+	// }
+
+	// if logger.Log != nil {
+	// 	logger.Log.Debug("pcsystem.PKG_EMAIL.GET_TEST_EMAIL() result",
+	// 		zap.String("email", testEmail.String))
+	// }
+	// return testEmail.String, nil
 }
 
 // ensureTestEmailPackageExistsTx создает временный пакет Oracle для работы с функцией GET_TEST_EMAIL
@@ -469,4 +472,3 @@ func (d *DBConnection) ensureEmailReportClobPackageExistsTx(tx *sql.Tx, ctx cont
 
 	return nil
 }
-

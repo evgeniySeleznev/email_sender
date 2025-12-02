@@ -126,7 +126,7 @@ func (c *POP3Client) GetMessagesStatus(ctx context.Context, sourceEmail string, 
 			processed++
 
 			// Удаляем обработанное сообщение
-			if err := client.dele(i); err != nil {
+			if err := client.deleteMsgId(i); err != nil {
 				logger.Log.Warn("Ошибка удаления сообщения", zap.Int("index", i), zap.Error(err))
 			}
 		}
@@ -270,9 +270,9 @@ func (c *pop3Client) retr(index int) ([]byte, error) {
 	return messageData, nil
 }
 
-// dele удаляет сообщение по индексу
-func (c *pop3Client) dele(index int) error {
-	_, err := c.commandRead("DELE %d", index)
+// deleteMsgId удаляет сообщение по индексу
+func (c *pop3Client) deleteMsgId(index int) error {
+	_, err := c.commandRead("DELETE %d", index)
 	return err
 }
 

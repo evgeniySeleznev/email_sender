@@ -86,11 +86,11 @@ func (s *Service) Run(ctx context.Context, wg *sync.WaitGroup) {
 	s.criticalErrorCount.Store(0)
 	s.needRestart.Store(false)
 
-	// Основной цикл обработки (jobLoop)
+	// Бесконечный цикл чтения из очереди (аналогично smsSender: while True)
 	for {
-		// Проверяем контекст
+		// Проверяем контекст перед началом итерации
 		if ctx.Err() != nil {
-			logger.Log.Info("Получен сигнал остановки, прекращаем обработку...")
+			logger.Log.Info("Получен сигнал остановки, прекращаем чтение из очереди...")
 			break
 		}
 
@@ -103,11 +103,83 @@ func (s *Service) Run(ctx context.Context, wg *sync.WaitGroup) {
 			s.needRestart.Store(true)
 		}
 
-		// 1. Выбираем из очереди неотправленное если (запуск сервиса) или (каждые 60 минут при пустой очереди на отправку)
-		if s.shouldDequeueAll() {
-			if s.dbConn.CheckConnection() {
-				s.dequeueAllMessages(ctx)
+		// Создаем новый канал для сигнала на каждой итерации
+		iterationSignalChan := make(chan struct{})
+
+		// Запускаем горутину с таймером на 2 минуты для контроля застрявших операций чтения
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			timer := time.NewTimer(2 * time.Minute)
+			defer timer.Stop()
+
+			select {
+			case <-timer.C:
+				// Таймер сработал - не получили ответ за 2 минуты
+				logger.Log.Warn("Таймаут: не получен ответ из DequeueMany в течение 2 минут, завершаем работу...")
+				// В данном случае просто логируем, так как контекст управляется извне
+			case <-iterationSignalChan:
+				// Получили сигнал - ответ получен, прекращаем работу горутины
+				return
+			case <-ctx.Done():
+				// Получен сигнал остановки
+				return
 			}
+		}()
+
+		// Получаем сообщения из основной очереди (аналогично Python: messages = queue.deqmany(settings.query_number))
+		// Используем DequeueMany с количеством сообщений (аналогично settings.query_number = 100)
+		// Передаем контекст для возможности отмены операций при graceful shutdown
+		var messages []*db.QueueMessage
+		var err error
+		if s.dbConn.CheckConnection() {
+			messages, err = s.queueReader.DequeueMany(ctx, 100) // Читаем до 100 сообщений как в smsSender
+		}
+
+		// Отправляем сигнал в горутину о получении ответа (независимо от результата)
+		close(iterationSignalChan)
+
+		// При graceful shutdown: обрабатываем уже вычитанные сообщения перед выходом
+		// DequeueMany возвращает сообщения даже при отмене контекста
+		gracefulShutdownInProgress := ctx.Err() == context.Canceled
+
+		if err != nil && !gracefulShutdownInProgress {
+			// Обычная ошибка (не graceful shutdown) - переподключение
+			logger.Log.Error("Ошибка при выборке сообщений", zap.Error(err))
+			logger.Log.Info("Ошибка соединения, переподключение...")
+			if !s.sleepWithContext(ctx, 5*time.Second) {
+				return
+			}
+			if err := s.dbConn.Reconnect(); err != nil {
+				logger.Log.Error("Ошибка переподключения", zap.Error(err))
+				if !s.sleepWithContext(ctx, 5*time.Second) {
+					return
+				}
+			}
+			continue
+		}
+
+		// При graceful shutdown: если есть вычитанные сообщения, обрабатываем их
+		if gracefulShutdownInProgress {
+			if len(messages) > 0 {
+				logger.Log.Info("Graceful shutdown: обработка вычитанных сообщений перед завершением",
+					zap.Int("count", len(messages)))
+			} else {
+				logger.Log.Info("Выборка сообщений отменена из-за graceful shutdown")
+				break
+			}
+		}
+
+		if len(messages) > 0 {
+			logger.Log.Info("Получено сообщений из очереди", zap.Int("count", len(messages)))
+			// Добавляем сообщения во внутреннюю очередь
+			for _, msg := range messages {
+				s.enqueueRequest(msg)
+			}
+		} else {
+			// Очередь пуста - логируем и продолжаем цикл
+			// Аналогично Python: logging.info(f"Очередь {self.connType} пуста в течение {settings.query_wait_time} секунд, перезапускаю слушатель")
+			logger.Log.Debug("Очередь пуста, ожидание следующей попытки...")
 		}
 
 		// 2. Отправляем сообщения провайдеру
@@ -128,11 +200,17 @@ func (s *Service) Run(ctx context.Context, wg *sync.WaitGroup) {
 			break
 		}
 
-		// Пауза между итерациями
-		select {
-		case <-ctx.Done():
+		// При graceful shutdown: выходим после обработки вычитанных сообщений
+		if gracefulShutdownInProgress {
+			logger.Log.Info("Graceful shutdown: все вычитанные сообщения обработаны, завершение")
+			break
+		}
+
+		// Пауза между циклами: 0.5 секунды (аналогично smsSender: time.sleep(settings.main_circle_pause))
+		// где main_circle_pause = 0.5 секунд
+		// Используем select для возможности прерывания во время задержки
+		if !s.sleepWithContext(ctx, 500*time.Millisecond) {
 			return
-		case <-time.After(50 * time.Millisecond):
 		}
 	}
 
@@ -141,49 +219,14 @@ func (s *Service) Run(ctx context.Context, wg *sync.WaitGroup) {
 	logger.Log.Info("Цикл обработки остановлен")
 }
 
-// shouldDequeueAll проверяет, нужно ли выполнить выборку всех сообщений
-func (s *Service) shouldDequeueAll() bool {
-	s.dequeueAllMu.Lock()
-	defer s.dequeueAllMu.Unlock()
-
-	if s.needRestart.Load() {
+// sleepWithContext выполняет задержку с возможностью прерывания через контекст
+// Возвращает false, если контекст был отменен
+func (s *Service) sleepWithContext(ctx context.Context, duration time.Duration) bool {
+	select {
+	case <-ctx.Done():
 		return false
-	}
-
-	if time.Now().After(s.nextDequeueAll) {
-		// Проверяем, пуста ли внутренняя очередь
-		if s.isRequestQueueEmpty() {
-			s.nextDequeueAll = time.Now().Add(60 * time.Minute)
-			return true
-		}
-		// Если очередь не пуста, откладываем выборку
-		s.nextDequeueAll = time.Now().Add(60 * time.Minute)
-	}
-	return false
-}
-
-// dequeueAllMessages выбирает все сообщения из Oracle очереди
-func (s *Service) dequeueAllMessages(ctx context.Context) {
-	logger.Log.Info("Выборка всех сообщений из очереди")
-
-	messages, err := s.queueReader.DequeueMany(ctx, portion)
-	if err != nil {
-		if ctx.Err() == context.Canceled {
-			return
-		}
-		logger.Log.Error("Ошибка выборки всех сообщений", zap.Error(err))
-		return
-	}
-
-	if len(messages) == 0 {
-		return
-	}
-
-	logger.Log.Info("Прочитано сообщений из очереди", zap.Int("count", len(messages)))
-
-	// Добавляем сообщения во внутреннюю очередь
-	for _, msg := range messages {
-		s.enqueueRequest(msg)
+	case <-time.After(duration):
+		return true
 	}
 }
 

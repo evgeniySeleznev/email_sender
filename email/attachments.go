@@ -51,18 +51,115 @@ func (p *AttachmentProcessor) processCrystalReport(ctx context.Context, attach *
 		return nil, fmt.Errorf("ошибка получения URL Web Service: %w", err)
 	}
 
+	// Получаем DBInstance из конфигурации
+	cfg := p.dbConn.GetConfig()
+	if cfg == nil {
+		return nil, fmt.Errorf("конфигурация не загружена")
+	}
+
+	dbInstance := cfg.Oracle.Instance
+	if dbInstance == "" {
+		dbInstance = cfg.Oracle.DSN
+	}
+	if dbInstance == "" {
+		return nil, fmt.Errorf("не указан DBInstance в конфигурации")
+	}
+
 	if logger.Log != nil {
 		logger.Log.Debug("Обработка Crystal Reports вложения",
 			zap.Int64("taskID", taskID),
 			zap.String("catalog", attach.Catalog),
 			zap.String("file", attach.File),
-			zap.String("url", url))
+			zap.String("url", url),
+			zap.String("dbInstance", dbInstance))
 	}
 
-	// TODO: Реализовать полный SOAP запрос к Crystal Reports Web Service
-	// Это требует знания структуры SOAP API Crystal Reports и параметров из attach.AttachParams
-	// Пока возвращаем ошибку, так как требуется реализация SOAP клиента
-	return nil, fmt.Errorf("Crystal Reports вложения пока не реализованы (требуется SOAP API): catalog=%s, file=%s, url=%s", attach.Catalog, attach.File, url)
+	// Создаем SOAP клиент
+	client := NewCrystalReportsClient(url)
+
+	// Шаг 1: Создаем запрос для getReportInfo
+	reportRequest := &ReportRequest{
+		Main: MainInfo{
+			ApplicationName: attach.Catalog,
+			DBInstance:     dbInstance,
+			DBPass:         attach.DbPass,
+			DBUser:         attach.DbLogin,
+			ExportFormat:   ExportFormatPDF,
+			ReportName:     attach.File,
+		},
+	}
+
+	// Шаг 2: Получаем информацию об отчете
+	reportInfo, err := client.GetReportInfo(ctx, reportRequest)
+	if err != nil {
+		return nil, fmt.Errorf("ошибка получения информации об отчете: %w", err)
+	}
+
+	if logger.Log != nil {
+		logger.Log.Debug("Получена информация об отчете",
+			zap.Int64("taskID", taskID),
+			zap.Int("paramsCount", len(reportInfo.Params)))
+	}
+
+	// Шаг 3: Создаем запрос с параметрами для getReport
+	reportWithParams := &ReportWithParams{
+		Main: reportRequest.Main,
+	}
+
+	// Применяем параметры отчета
+	if len(attach.AttachParams) > 0 && len(reportInfo.Params) > 0 {
+		params := make([]Param, 0, len(reportInfo.Params))
+
+		// Создаем карту параметров из attach.AttachParams для быстрого поиска
+		paramValues := make(map[string]string)
+		for k, v := range attach.AttachParams {
+			paramValues[k] = v
+		}
+
+		// Обновляем параметры из reportInfo значениями из attach.AttachParams
+		for _, infoParam := range reportInfo.Params {
+			param := infoParam
+			if value, ok := paramValues[infoParam.Name]; ok {
+				param.Value = value
+			}
+			params = append(params, param)
+		}
+
+		if len(params) > 0 {
+			reportWithParams.MainReport = &MainReport{
+				ReportParams: ReportParams{
+					Params: params,
+				},
+			}
+		}
+	}
+
+	// Шаг 4: Генерируем отчет
+	base64Data, err := client.GetReport(ctx, reportWithParams)
+	if err != nil {
+		return nil, fmt.Errorf("ошибка генерации отчета: %w", err)
+	}
+
+	// Шаг 5: Декодируем из Base64
+	data, err := base64.StdEncoding.DecodeString(base64Data)
+	if err != nil {
+		return nil, fmt.Errorf("ошибка декодирования Base64: %w", err)
+	}
+
+	if len(data) == 0 {
+		return nil, fmt.Errorf("пустой отчет")
+	}
+
+	if logger.Log != nil {
+		logger.Log.Debug("Crystal Reports отчет успешно сгенерирован",
+			zap.Int64("taskID", taskID),
+			zap.Int("size", len(data)))
+	}
+
+	return &AttachmentData{
+		FileName: attach.FileName,
+		Data:     data,
+	}, nil
 }
 
 // processCLOB обрабатывает CLOB вложение из БД

@@ -12,8 +12,9 @@ email-service.windows
 *.exe
 main
 
-# Логи
+# Логи и планы
 logs/
+/md
 *.log
 *.log.*
 
