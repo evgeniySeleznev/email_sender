@@ -112,10 +112,21 @@ func (c *POP3Client) GetMessagesStatus(ctx context.Context, sourceEmail string, 
 			break
 		}
 
+		// Логируем информацию о сообщении для отладки
+		var msgDate time.Time
+		if msg.Date != nil {
+			msgDate = *msg.Date
+		}
+		logger.Log.Debug("Обработка сообщения из POP3",
+			zap.Int("index", i),
+			zap.Int("partsCount", len(msg.Parts)),
+			zap.Int("bodySize", len(msg.Body)),
+			zap.Time("date", msgDate))
+
 		// Обрабатываем DSN
 		taskID, status, statusDesc := ProcessDeliveryStatusNotification(sourceEmail, msg)
 		if taskID > 0 && status > 0 {
-			logger.Log.Debug("Получен статус доставки",
+			logger.Log.Info("Получен статус доставки",
 				zap.Int64("taskID", taskID),
 				zap.Int("status", status),
 				zap.String("description", statusDesc))
@@ -129,6 +140,11 @@ func (c *POP3Client) GetMessagesStatus(ctx context.Context, sourceEmail string, 
 			if err := client.deleteMsgId(i); err != nil {
 				logger.Log.Warn("Ошибка удаления сообщения", zap.Int("index", i), zap.Error(err))
 			}
+		} else if taskID == 0 && status == 0 {
+			// Логируем, если это не DSN сообщение (для отладки)
+			logger.Log.Debug("Сообщение не является DSN или не содержит наш envelope ID",
+				zap.Int("index", i),
+				zap.Int("partsCount", len(msg.Parts)))
 		}
 	}
 

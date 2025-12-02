@@ -19,9 +19,9 @@ const (
 
 // MIMEMessage представляет распарсенное MIME сообщение
 type MIMEMessage struct {
-	Date    *time.Time
-	Body    []byte
-	Parts   []*MIMEPart
+	Date  *time.Time
+	Body  []byte
+	Parts []*MIMEPart
 }
 
 // MIMEPart представляет часть MIME сообщения
@@ -96,10 +96,10 @@ func ParseMIMEMessage(data []byte) (*MIMEMessage, error) {
 func parseRFC5322Date(dateStr string) (time.Time, error) {
 	// Пробуем разные форматы даты
 	formats := []string{
-		time.RFC1123Z,     // Mon, 02 Jan 2006 15:04:05 -0700
-		time.RFC1123,      // Mon, 02 Jan 2006 15:04:05 MST
-		time.RFC822Z,      // 02 Jan 06 15:04 -0700
-		time.RFC822,       // 02 Jan 06 15:04 MST
+		time.RFC1123Z, // Mon, 02 Jan 2006 15:04:05 -0700
+		time.RFC1123,  // Mon, 02 Jan 2006 15:04:05 MST
+		time.RFC822Z,  // 02 Jan 06 15:04 -0700
+		time.RFC822,   // 02 Jan 06 15:04 MST
 		"Mon, 2 Jan 2006 15:04:05 -0700",
 		"Mon, 2 Jan 2006 15:04:05 MST",
 	}
@@ -121,8 +121,14 @@ func ProcessDeliveryStatusNotification(sourceEmail string, msg *MIMEMessage) (ta
 	}
 
 	// Ищем multipart/report с report-type="delivery-status"
-	for _, part := range msg.Parts {
+	for i, part := range msg.Parts {
 		if part.ContentType == "message/delivery-status" || strings.Contains(part.ContentType, "delivery-status") {
+			if logger.Log != nil {
+				logger.Log.Debug("Найдена DSN часть",
+					zap.Int("partIndex", i),
+					zap.String("contentType", part.ContentType),
+					zap.Int("bodySize", len(part.Body)))
+			}
 			return parseDSNPart(sourceEmail, part.Body)
 		}
 	}
@@ -131,7 +137,11 @@ func ProcessDeliveryStatusNotification(sourceEmail string, msg *MIMEMessage) (ta
 	if len(msg.Body) > 0 {
 		// Пробуем найти DSN в теле сообщения
 		bodyStr := string(msg.Body)
-		if strings.Contains(bodyStr, "delivery-status") || strings.Contains(bodyStr, "Original-Envelope-Id") {
+		if strings.Contains(bodyStr, "delivery-status") || strings.Contains(bodyStr, "Original-Envelope-Id") || strings.Contains(bodyStr, "X-Envelope-ID") {
+			if logger.Log != nil {
+				logger.Log.Debug("Найден DSN в основном теле сообщения",
+					zap.Int("bodySize", len(msg.Body)))
+			}
 			return parseDSNBody(sourceEmail, msg.Body)
 		}
 	}
@@ -148,14 +158,25 @@ func parseDSNPart(sourceEmail string, body []byte) (taskID int64, status int, st
 func parseDSNBody(sourceEmail string, body []byte) (taskID int64, status int, statusDesc string) {
 	bodyStr := string(body)
 
-	// Ищем Original-Envelope-Id
+	// Ищем Original-Envelope-Id или X-Envelope-ID
 	envelopeID := extractHeaderValue(bodyStr, "Original-Envelope-Id")
 	if envelopeID == "" {
+		envelopeID = extractHeaderValue(bodyStr, "X-Envelope-ID")
+	}
+	if envelopeID == "" {
+		if logger.Log != nil {
+			logger.Log.Debug("DSN сообщение не содержит Original-Envelope-Id или X-Envelope-ID")
+		}
 		return 0, 0, ""
 	}
 
 	// Проверяем, что это наш envelope ID
 	if !strings.HasPrefix(envelopeID, EnvelopePrefix) {
+		if logger.Log != nil {
+			logger.Log.Debug("Envelope ID не соответствует нашему префиксу",
+				zap.String("envelopeID", envelopeID),
+				zap.String("expectedPrefix", EnvelopePrefix))
+		}
 		return 0, 0, ""
 	}
 
@@ -213,6 +234,13 @@ func parseDSNBody(sourceEmail string, body []byte) (taskID int64, status int, st
 
 	// Определяем статус по Action
 	action = strings.ToLower(strings.TrimSpace(action))
+	if logger.Log != nil {
+		logger.Log.Debug("Обработка DSN Action",
+			zap.String("action", action),
+			zap.String("emailAddr", emailAddr),
+			zap.Int64("taskID", taskID))
+	}
+
 	switch action {
 	case "failed":
 		status = 3 // Failed
@@ -220,17 +248,25 @@ func parseDSNBody(sourceEmail string, body []byte) (taskID int64, status int, st
 	case "delayed":
 		status = 0 // Не обрабатываем delayed
 		statusDesc = fmt.Sprintf("Задержка доставки %s", emailAddr)
+		if logger.Log != nil {
+			logger.Log.Debug("Пропускаем delayed статус")
+		}
 		return 0, 0, "" // Не возвращаем статус для delayed
 	case "delivered":
 		status = 4 // Delivered
 		statusDesc = fmt.Sprintf("Доставлено для %s", emailAddr)
 	case "relayed":
-		status = 2 // Sended
+		status = 2 // Sended (релей обычно означает успешную передачу следующему серверу)
 		statusDesc = fmt.Sprintf("Релей для %s", emailAddr)
 	case "expanded":
 		status = 4 // Delivered
 		statusDesc = fmt.Sprintf("Доставлено для %s и релей для остальных", emailAddr)
 	default:
+		if logger.Log != nil {
+			logger.Log.Debug("Неизвестный Action в DSN",
+				zap.String("action", action),
+				zap.Int64("taskID", taskID))
+		}
 		return 0, 0, ""
 	}
 
@@ -256,4 +292,3 @@ func extractHeaderValue(body, headerName string) string {
 	}
 	return ""
 }
-
