@@ -628,7 +628,7 @@ func (s *Service) shouldLoadStatuses() bool {
 	}
 
 	if time.Now().After(s.nextLoadStatuses) {
-		s.nextLoadStatuses = time.Now().Add(60 * time.Minute)
+		s.nextLoadStatuses = time.Now().Add(5 * time.Minute)
 		return true
 	}
 	return false
