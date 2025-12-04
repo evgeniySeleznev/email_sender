@@ -330,6 +330,14 @@ func (s *Service) sendMessage(ctx context.Context, msg *db.QueueMessage) {
 		return
 	}
 
+	// Логируем XML для отладки (первые 500 символов)
+	xmlPreview := msg.XMLPayload
+	if len(xmlPreview) > 500 {
+		xmlPreview = xmlPreview[:500] + "..."
+	}
+	logger.Log.Debug("XML из очереди",
+		zap.String("xmlPreview", xmlPreview))
+
 	// Преобразуем в ParsedEmailMessage
 	emailMsg, err := email.ParseEmailMessage(parsed)
 	if err != nil {
@@ -340,6 +348,11 @@ func (s *Service) sendMessage(ctx context.Context, msg *db.QueueMessage) {
 	}
 
 	taskID = emailMsg.TaskID
+
+	logger.Log.Debug("Email сообщение распарсено",
+		zap.Int64("taskID", taskID),
+		zap.String("emailAddress", emailMsg.EmailAddress),
+		zap.String("title", emailMsg.Title))
 
 	// Проверяем частоту отправки на email адреса
 	if err := s.checkAndUpdateRateLimits(emailMsg); err != nil {
@@ -363,11 +376,22 @@ func (s *Service) sendMessage(ctx context.Context, msg *db.QueueMessage) {
 	attachments, err := email.ParseAttachments(msg.XMLPayload, emailMsg.TaskID)
 	if err != nil {
 		logger.Log.Warn("Ошибка парсинга вложений", zap.Error(err), zap.Int64("taskID", emailMsg.TaskID))
+	} else {
+		logger.Log.Debug("Вложения распарсены из XML",
+			zap.Int64("taskID", emailMsg.TaskID),
+			zap.Int("attachmentsCount", len(attachments)))
 	}
 
 	// Обрабатываем вложения
 	attachmentData := make([]email.AttachmentData, 0, len(attachments))
-	for _, attach := range attachments {
+	for i, attach := range attachments {
+		logger.Log.Debug("Обработка вложения",
+			zap.Int64("taskID", emailMsg.TaskID),
+			zap.Int("index", i+1),
+			zap.Int("total", len(attachments)),
+			zap.Int("reportType", attach.ReportType),
+			zap.String("fileName", attach.FileName))
+
 		attachData, err := s.emailService.ProcessAttachment(ctx, &attach, emailMsg.TaskID)
 		if err != nil {
 			logger.Log.Error("Ошибка обработки вложения",
@@ -378,8 +402,19 @@ func (s *Service) sendMessage(ctx context.Context, msg *db.QueueMessage) {
 			// Продолжаем обработку остальных вложений
 			continue
 		}
+
+		logger.Log.Debug("Вложение успешно обработано",
+			zap.Int64("taskID", emailMsg.TaskID),
+			zap.String("fileName", attachData.FileName),
+			zap.Int("dataSize", len(attachData.Data)))
+
 		attachmentData = append(attachmentData, *attachData)
 	}
+
+	logger.Log.Info("Обработка вложений завершена",
+		zap.Int64("taskID", emailMsg.TaskID),
+		zap.Int("totalParsed", len(attachments)),
+		zap.Int("totalProcessed", len(attachmentData)))
 
 	// Отправляем email
 	emailMsgForSend := &email.EmailMessage{

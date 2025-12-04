@@ -2,9 +2,13 @@ package email
 
 import (
 	"context"
+	"fmt"
 	"sync"
 	"time"
 
+	"go.uber.org/zap"
+
+	"email-service/logger"
 	"email-service/settings"
 )
 
@@ -32,7 +36,7 @@ type StatusChecker struct {
 func NewStatusChecker(cfg *settings.Config, statusCallback StatusUpdateCallback) *StatusChecker {
 	return &StatusChecker{
 		cfg:                  cfg,
-		statusCheckChan:      make(chan *SentEmailInfo, 1000),
+		statusCheckChan:      make(chan *SentEmailInfo, 2000),
 		statusUpdateCallback: statusCallback,
 		sentEmails:           make(map[int64]*SentEmailInfo),
 	}
@@ -66,11 +70,27 @@ func (sc *StatusChecker) statusChecker(ctx context.Context) {
 		case <-ctx.Done():
 			return
 		case sentInfo := <-sc.statusCheckChan:
+			if sentInfo == nil {
+				continue
+			}
+
+			if logger.Log != nil {
+				logger.Log.Debug("Запланирована проверка статуса письма",
+					zap.Int64("taskID", sentInfo.TaskID),
+					zap.String("messageID", sentInfo.MessageID),
+					zap.Duration("delay", 30*time.Second))
+			}
+
 			go func(info *SentEmailInfo) {
 				select {
 				case <-ctx.Done():
 					return
 				case <-time.After(30 * time.Second):
+					if logger.Log != nil {
+						logger.Log.Debug("Начало проверки статуса письма",
+							zap.Int64("taskID", info.TaskID),
+							zap.String("messageID", info.MessageID))
+					}
 					sc.checkEmailStatus(ctx, info)
 				}
 			}(sentInfo)
@@ -81,24 +101,55 @@ func (sc *StatusChecker) statusChecker(ctx context.Context) {
 // checkEmailStatus проверяет статус письма через IMAP
 func (sc *StatusChecker) checkEmailStatus(ctx context.Context, sentInfo *SentEmailInfo) {
 	if sentInfo == nil {
+		if logger.Log != nil {
+			logger.Log.Warn("checkEmailStatus вызван с nil sentInfo")
+		}
 		return
 	}
 
 	if sentInfo.SmtpID < 0 || sentInfo.SmtpID >= len(sc.cfg.SMTP) {
+		if logger.Log != nil {
+			logger.Log.Warn("Некорректный SmtpID для проверки статуса",
+				zap.Int64("taskID", sentInfo.TaskID),
+				zap.Int("smtpID", sentInfo.SmtpID),
+				zap.Int("smtpCount", len(sc.cfg.SMTP)))
+		}
+		sc.updateEmailStatus(sentInfo.TaskID, 3, "Некорректный SmtpID")
 		return
 	}
 	smtpCfg := &sc.cfg.SMTP[sentInfo.SmtpID]
 
-	if smtpCfg.IMAPHost != "" {
-		imapClient := NewIMAPClient(smtpCfg)
-		status, statusDesc, err := imapClient.CheckEmailStatus(ctx, sentInfo.MessageID)
-		if err == nil {
-			sc.updateEmailStatus(sentInfo.TaskID, status, statusDesc)
-			return
+	if smtpCfg.IMAPHost == "" {
+		if logger.Log != nil {
+			logger.Log.Debug("IMAP не настроен для проверки статуса",
+				zap.Int64("taskID", sentInfo.TaskID),
+				zap.Int("smtpID", sentInfo.SmtpID))
 		}
+		// Если IMAP не настроен, считаем письмо успешно отправленным (статус 4)
+		sc.updateEmailStatus(sentInfo.TaskID, 4, "IMAP не настроен, статус не проверяется")
+		return
 	}
 
-	sc.updateEmailStatus(sentInfo.TaskID, 3, "Ошибка проверки статуса через IMAP")
+	imapClient := NewIMAPClient(smtpCfg)
+	status, statusDesc, err := imapClient.CheckEmailStatus(ctx, sentInfo.MessageID)
+	if err != nil {
+		if logger.Log != nil {
+			logger.Log.Error("Ошибка проверки статуса через IMAP",
+				zap.Int64("taskID", sentInfo.TaskID),
+				zap.String("messageID", sentInfo.MessageID),
+				zap.Error(err))
+		}
+		sc.updateEmailStatus(sentInfo.TaskID, 3, fmt.Sprintf("Ошибка проверки статуса через IMAP: %v", err))
+		return
+	}
+
+	if logger.Log != nil {
+		logger.Log.Info("Статус письма проверен",
+			zap.Int64("taskID", sentInfo.TaskID),
+			zap.Int("status", status),
+			zap.String("statusDesc", statusDesc))
+	}
+	sc.updateEmailStatus(sentInfo.TaskID, status, statusDesc)
 }
 
 // updateEmailStatus обновляет статус письма в БД через callback
