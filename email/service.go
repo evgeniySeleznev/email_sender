@@ -141,6 +141,35 @@ func (s *Service) ProcessAttachment(ctx context.Context, attach *Attachment, tas
 	return s.attachmentProcessor.ProcessAttachment(ctx, attach, taskID)
 }
 
+// LogIMAPFolders логирует список папок для всех настроенных IMAP серверов
+func (s *Service) LogIMAPFolders(ctx context.Context) {
+	for i, smtpCfg := range s.cfg.SMTP {
+		if smtpCfg.IMAPHost == "" {
+			continue
+		}
+
+		imapClient := NewIMAPClient(&smtpCfg)
+		folders, err := imapClient.ListFolders(ctx)
+		if err != nil {
+			if logger.Log != nil {
+				logger.Log.Warn("Ошибка получения списка папок IMAP",
+					zap.Int("smtpIndex", i),
+					zap.String("imapHost", smtpCfg.IMAPHost),
+					zap.Error(err))
+			}
+			continue
+		}
+
+		if logger.Log != nil {
+			logger.Log.Info("Список папок на IMAP сервере",
+				zap.Int("smtpIndex", i),
+				zap.String("imapHost", smtpCfg.IMAPHost),
+				zap.Int("foldersCount", len(folders)),
+				zap.Strings("folders", folders))
+		}
+	}
+}
+
 // EmailMessage представляет email сообщение для отправки
 type EmailMessage struct {
 	TaskID       int64
