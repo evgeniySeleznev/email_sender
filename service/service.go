@@ -46,20 +46,19 @@ type Service struct {
 	// Периодическая выборка всех сообщений
 	nextDequeueAll time.Time
 	dequeueAllMu   sync.Mutex
-
 }
 
 // NewService создает новый сервис
 func NewService(cfg *settings.Config, dbConn *db.DBConnection, queueReader *db.QueueReader) *Service {
 	s := &Service{
-		cfg:          cfg,
-		dbConn:       dbConn,
-		queueReader:  queueReader,
+		cfg:         cfg,
+		dbConn:      dbConn,
+		queueReader: queueReader,
 
-		requestDir:       make(map[string]*db.QueueMessage),
-		responseQueue:    make(chan db.SaveEmailResponseParams, 10000), // Буферизованный канал
-		sendEmailMap:     make(map[string]time.Time),
-		nextDequeueAll:   time.Now(), // Сразу при запуске
+		requestDir:     make(map[string]*db.QueueMessage),
+		responseQueue:  make(chan db.SaveEmailResponseParams, 10000), // Буферизованный канал
+		sendEmailMap:   make(map[string]time.Time),
+		nextDequeueAll: time.Now(), // Сразу при запуске
 	}
 
 	// Запускаем горутину для записи результатов в БД
@@ -305,8 +304,13 @@ func (s *Service) sendMessage(ctx context.Context, msg *db.QueueMessage) {
 	taskID := int64(-1)
 	defer func() {
 		// Сохраняем результат в очередь результатов
+		// В error_text попадают только сообщения об ошибках (статус 3)
 		if taskID > 0 {
-			s.enqueueResponse(taskID, status, statusDesc)
+			errorText := ""
+			if status == 3 {
+				errorText = statusDesc
+			}
+			s.enqueueResponse(taskID, status, errorText)
 		}
 	}()
 
@@ -398,8 +402,8 @@ func (s *Service) sendMessage(ctx context.Context, msg *db.QueueMessage) {
 			s.criticalErrorCount.Add(1)
 		}
 	} else {
-		status = 2 // Sended
-		statusDesc = fmt.Sprintf("Успешно отправлено SMTP [%d] [%s]", emailMsg.SmtpID, emailMsg.EmailAddress)
+		status = 2      // Sended
+		statusDesc = "" // Для успешной отправки error_text должен быть пустым
 		logger.Log.Info("Email успешно отправлен", zap.Int64("taskID", taskID))
 	}
 }
@@ -611,7 +615,13 @@ func (s *Service) writeResponseBatch(batch []db.SaveEmailResponseParams) {
 // GetStatusUpdateCallback возвращает callback для обновления статуса письма
 func (s *Service) GetStatusUpdateCallback() email.StatusUpdateCallback {
 	return func(taskID int64, status int, statusDesc string) {
-		s.enqueueResponse(taskID, status, statusDesc)
+		// В error_text попадают только сообщения об ошибках (статус 3)
+		// Для успешных статусов (2 и 4) error_text должен быть пустым
+		errorText := ""
+		if status == 3 {
+			errorText = statusDesc
+		}
+		s.enqueueResponse(taskID, status, errorText)
 	}
 }
 

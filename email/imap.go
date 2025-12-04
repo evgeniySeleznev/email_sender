@@ -328,7 +328,7 @@ func extractMessageID(emailBody string) string {
 	return ""
 }
 
-// CheckEmailStatus проверяет статус письма по Message-ID в папках "исходящие" и "отправленные"
+// CheckEmailStatus проверяет статус письма по Message-ID в папках "отправленные" и bounce messages во всех папках входящих
 // Возвращает status (0 - не найдено, 3 - ошибка, 4 - отправлено), описание и ошибку
 func (c *IMAPClient) CheckEmailStatus(ctx context.Context, messageID string) (int, string, error) {
 	if c.cfg.IMAPHost == "" {
@@ -371,7 +371,28 @@ func (c *IMAPClient) CheckEmailStatus(ctx context.Context, messageID string) (in
 		return 0, "", fmt.Errorf("ошибка аутентификации IMAP: %w", err)
 	}
 
-	// Проверяем только папку "отправленные" (Sent)
+	// Сначала проверяем bounce messages во всех папках входящих (включая INBOX)
+	inboxFolders, err := c.listInboxFolders(imapClient)
+	if err == nil {
+		// Добавляем INBOX в начало списка, так как bounce messages обычно приходят туда
+		inboxFolders = append([]string{"INBOX"}, inboxFolders...)
+
+		for _, folderName := range inboxFolders {
+			bounceStatus, bounceDesc, err := c.checkBounceMessages(imapClient, folderName, messageID)
+			if err == nil && bounceStatus == 3 {
+				// Найдено bounce message - письмо не доставлено
+				return 3, bounceDesc, nil
+			}
+		}
+	} else {
+		// Если не удалось получить список папок, проверяем хотя бы INBOX
+		bounceStatus, bounceDesc, err := c.checkBounceMessages(imapClient, "INBOX", messageID)
+		if err == nil && bounceStatus == 3 {
+			return 3, bounceDesc, nil
+		}
+	}
+
+	// Проверяем папку "отправленные" (Sent)
 	sentFolders := []string{"Sent", "Отправленные", "Sent Items"}
 
 	for _, folderName := range sentFolders {
@@ -382,7 +403,7 @@ func (c *IMAPClient) CheckEmailStatus(ctx context.Context, messageID string) (in
 		}
 	}
 
-	// Не найдено в Sent - ошибка отправки
+	// Не найдено в Sent и нет bounce messages - ошибка отправки
 	return 3, "Письмо не найдено в папке Sent", nil
 }
 
@@ -461,4 +482,273 @@ func (c *IMAPClient) checkFolderForMessage(imapClient *client.Client, folderName
 
 	// Письмо найдено через SEARCH
 	return 1, nil
+}
+
+// listInboxFolders получает список всех папок входящих (INBOX|*, Spam, Trash и другие корневые папки входящих)
+// INBOX добавляется отдельно в CheckEmailStatus, так как bounce messages обычно приходят туда
+func (c *IMAPClient) listInboxFolders(imapClient *client.Client) ([]string, error) {
+	mailboxes := make(chan *imap.MailboxInfo, 10)
+	done := make(chan error, 1)
+
+	go func() {
+		done <- imapClient.List("", "*", mailboxes)
+	}()
+
+	var folders []string
+	for {
+		select {
+		case err := <-done:
+			if err != nil {
+				return nil, err
+			}
+			return folders, nil
+		case mbox := <-mailboxes:
+			if mbox == nil {
+				continue
+			}
+			// Добавляем все папки, которые могут содержать входящие письма
+			// Включаем INBOX|*, Spam, Trash и другие корневые папки
+			folderName := mbox.Name
+			// Пропускаем саму папку INBOX (она добавляется отдельно в CheckEmailStatus)
+			if folderName == "INBOX" {
+				continue
+			}
+			// Включаем подпапки INBOX (INBOX|*)
+			if strings.HasPrefix(folderName, "INBOX|") {
+				folders = append(folders, folderName)
+			}
+			// Включаем корневые папки типа Spam, Trash
+			if folderName == "Spam" || folderName == "Trash" {
+				folders = append(folders, folderName)
+			}
+		}
+	}
+}
+
+// checkBounceMessages проверяет наличие bounce messages в указанной папке
+// Ищет письма о недоставке, которые ссылаются на указанный Message-ID
+func (c *IMAPClient) checkBounceMessages(imapClient *client.Client, folderName, messageID string) (int, string, error) {
+	// Пробуем выбрать папку
+	_, err := imapClient.Select(folderName, false)
+	if err != nil {
+		// Если папка недоступна, возвращаем что не найдено
+		return 0, "", err
+	}
+
+	messageIDClean := strings.Trim(messageID, "<>")
+
+	// Получаем статус папки
+	mailboxStatus, err := imapClient.Status(folderName, []imap.StatusItem{imap.StatusMessages})
+	if err != nil {
+		return 0, "", err
+	}
+
+	if mailboxStatus.Messages == 0 {
+		return 0, "", nil
+	}
+
+	// Проверяем последние 200 писем (bounce messages обычно приходят быстро)
+	maxMessages := uint32(200)
+	if mailboxStatus.Messages < maxMessages {
+		maxMessages = mailboxStatus.Messages
+	}
+
+	seqSet := new(imap.SeqSet)
+	seqSet.AddRange(mailboxStatus.Messages-maxMessages+1, mailboxStatus.Messages)
+
+	// Получаем заголовки и тело письма
+	items := []imap.FetchItem{
+		imap.FetchEnvelope,
+		imap.FetchUid,
+	}
+
+	messages := make(chan *imap.Message, 10)
+	done := make(chan error, 1)
+
+	go func() {
+		done <- imapClient.Fetch(seqSet, items, messages)
+	}()
+
+	for {
+		select {
+		case err := <-done:
+			if err != nil {
+				return 0, "", err
+			}
+			// Проверка завершена, bounce messages не найдено
+			return 0, "", nil
+
+		case msg := <-messages:
+			if msg == nil {
+				continue
+			}
+
+			// Проверяем, является ли это bounce message
+			if c.isBounceMessage(msg, messageIDClean) {
+				// Получаем полное тело письма для извлечения деталей ошибки и проверки Message-ID
+				errorDesc, found := c.extractBounceError(msg, imapClient, folderName, messageIDClean)
+				if found {
+					return 3, errorDesc, nil
+				}
+			}
+		}
+	}
+}
+
+// isBounceMessage проверяет, является ли письмо bounce message для указанного Message-ID
+func (c *IMAPClient) isBounceMessage(msg *imap.Message, messageIDClean string) bool {
+	if msg.Envelope == nil {
+		return false
+	}
+
+	// Проверяем отправителя на типичные адреса bounce messages
+	from := ""
+	if len(msg.Envelope.From) > 0 {
+		from = strings.ToLower(msg.Envelope.From[0].Address())
+	}
+
+	bounceFromKeywords := []string{
+		"mailer-daemon",
+		"postmaster",
+		"mail delivery subsystem",
+		"mailer@",
+		"noreply@",
+	}
+
+	isBounceFrom := false
+	for _, keyword := range bounceFromKeywords {
+		if strings.Contains(from, keyword) {
+			isBounceFrom = true
+			break
+		}
+	}
+
+	// Проверяем Subject на типичные паттерны bounce messages
+	subject := strings.ToLower(msg.Envelope.Subject)
+	bounceKeywords := []string{
+		"delivery status notification",
+		"mail delivery failed",
+		"undelivered mail",
+		"returned mail",
+		"mail delivery subsystem",
+		"delivery failure",
+		"failure notice",
+		"недоставленное сообщение",
+		"недоставленное письмо",
+		"ошибка доставки",
+		"возврат письма",
+		"не может быть отправлено",
+	}
+
+	isBounceSubject := false
+	for _, keyword := range bounceKeywords {
+		if strings.Contains(subject, keyword) {
+			isBounceSubject = true
+			break
+		}
+	}
+
+	// Если это не bounce message по отправителю и теме, пропускаем
+	if !isBounceFrom && !isBounceSubject {
+		return false
+	}
+
+	// Проверяем заголовки на наличие Message-ID исходного письма
+	// Проверяем Envelope.InReplyTo
+	if msg.Envelope.InReplyTo != "" {
+		inReplyToClean := strings.Trim(msg.Envelope.InReplyTo, "<>")
+		if strings.Contains(inReplyToClean, messageIDClean) || strings.Contains(messageIDClean, inReplyToClean) {
+			return true
+		}
+	}
+
+	// Если это bounce message по отправителю и теме, считаем его релевантным
+	// Проверка Message-ID в теле письма будет выполнена в extractBounceError
+	return isBounceFrom && isBounceSubject
+}
+
+// extractBounceError извлекает описание ошибки из bounce message и проверяет наличие Message-ID в теле
+// Возвращает описание ошибки и флаг, указывающий, найден ли Message-ID в теле письма
+func (c *IMAPClient) extractBounceError(msg *imap.Message, imapClient *client.Client, folderName, messageIDClean string) (string, bool) {
+	if msg.Uid == 0 {
+		return "", false
+	}
+
+	// Получаем тело письма
+	seqSet := new(imap.SeqSet)
+	seqSet.AddNum(msg.Uid)
+
+	section := &imap.BodySectionName{}
+	items := []imap.FetchItem{section.FetchItem()}
+
+	messages := make(chan *imap.Message, 1)
+	done := make(chan error, 1)
+
+	go func() {
+		done <- imapClient.UidFetch(seqSet, items, messages)
+	}()
+
+	select {
+	case err := <-done:
+		if err != nil {
+			return "", false
+		}
+	case msg := <-messages:
+		if msg == nil {
+			return "", false
+		}
+
+		// Извлекаем тело письма
+		if body := msg.GetBody(section); body != nil {
+			buf := new(bytes.Buffer)
+			if _, err := buf.ReadFrom(body); err == nil {
+				bodyText := buf.String()
+				bodyLower := strings.ToLower(bodyText)
+
+				// Проверяем наличие Message-ID в теле письма
+				// Ищем Message-ID с угловыми скобками и без них
+				messageIDInBody := strings.Contains(bodyText, messageIDClean) ||
+					strings.Contains(bodyText, "<"+messageIDClean+">") ||
+					strings.Contains(bodyText, "message-id:") && strings.Contains(bodyText, messageIDClean)
+
+				if !messageIDInBody {
+					// Message-ID не найден в теле - это не наш bounce message
+					return "", false
+				}
+
+				// Ищем типичные сообщения об ошибках
+				errorPatterns := []struct {
+					pattern string
+					desc    string
+				}{
+					{"550", "Адрес получателя не существует (550)"},
+					{"551", "Пользователь не найден (551)"},
+					{"552", "Превышен лимит почтового ящика (552)"},
+					{"553", "Адрес получателя неверен (553)"},
+					{"user unknown", "Пользователь не найден"},
+					{"mailbox full", "Почтовый ящик переполнен"},
+					{"address rejected", "Адрес отклонен"},
+					{"relay denied", "Ретрансляция запрещена"},
+					{"host or domain name not found", "Домен или хост не найден"},
+					{"host not found", "Хост не найден"},
+					{"name service error", "Ошибка службы имен"},
+					{"не существует", "Адрес не существует"},
+					{"не найден", "Пользователь не найден"},
+					{"переполнен", "Почтовый ящик переполнен"},
+					{"не может быть отправлено", "Письмо не может быть отправлено"},
+				}
+
+				for _, pattern := range errorPatterns {
+					if strings.Contains(bodyLower, pattern.pattern) {
+						return fmt.Sprintf("Bounce message в папке '%s': %s", folderName, pattern.desc), true
+					}
+				}
+
+				// Если не нашли конкретную ошибку, возвращаем общее сообщение
+				return fmt.Sprintf("Найдено bounce message о недоставке в папке '%s'", folderName), true
+			}
+		}
+	}
+
+	return "", false
 }

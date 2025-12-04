@@ -188,7 +188,7 @@ func (d *DBConnection) GetTestEmail() (string, error) {
 		return "", fmt.Errorf("соединение с БД недоступно")
 	}
 
-	return "evgen.seleznev@gmail.com", nil
+	return "evgen.seleznev@xjrwerwerdddd.com", nil
 
 	// отключено на время тестирования
 	// queryCtx, queryCancel := context.WithTimeout(context.Background(), QueryTimeout)
