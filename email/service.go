@@ -19,14 +19,13 @@ type Service struct {
 	cfg                 *settings.Config
 	dbConn              *db.DBConnection
 	smtpClients         []*SMTPClient
-	imapClients         []*IMAPClient // IMAP клиенты для сохранения в Sent
 	attachmentProcessor *AttachmentProcessor
 	testEmail           string
 	testEmailCacheTime  time.Time
 	testEmailMu         sync.RWMutex
 	testEmailCacheTTL   time.Duration
 
-	// Проверка статуса отправленных писем
+	// Проверка статуса отправленных писем (bounce через IMAP)
 	statusChecker *StatusChecker
 }
 
@@ -34,24 +33,15 @@ type Service struct {
 func NewService(cfg *settings.Config, dbConn *db.DBConnection, statusCallback StatusUpdateCallback) (*Service, error) {
 	// Создаем SMTP клиенты для каждого SMTP сервера
 	smtpClients := make([]*SMTPClient, 0, len(cfg.SMTP))
-	imapClients := make([]*IMAPClient, 0, len(cfg.SMTP))
 	for i := range cfg.SMTP {
 		smtpClient := NewSMTPClient(&cfg.SMTP[i])
 		smtpClients = append(smtpClients, smtpClient)
-		// Создаем IMAP клиент для сохранения в Sent (если IMAP настроен)
-		if cfg.SMTP[i].IMAPHost != "" {
-			imapClient := NewIMAPClient(&cfg.SMTP[i])
-			imapClients = append(imapClients, imapClient)
-		} else {
-			imapClients = append(imapClients, nil)
-		}
 	}
 
 	service := &Service{
 		cfg:                 cfg,
 		dbConn:              dbConn,
 		smtpClients:         smtpClients,
-		imapClients:         imapClients,
 		attachmentProcessor: NewAttachmentProcessor(dbConn),
 		testEmailCacheTTL:   5 * time.Minute, // Кеш тестового email на 5 минут
 		statusChecker:       NewStatusChecker(cfg, statusCallback),
@@ -96,11 +86,11 @@ func (s *Service) SendEmail(ctx context.Context, msg *EmailMessage) error {
 
 	smtpClient := s.smtpClients[smtpIndex]
 
-	// Получаем тело письма для сохранения в папку Outbox
+	// Получаем тело письма для отправки
 	recipientEmails := smtpClient.parseEmailAddresses(msg.EmailAddress, testEmail)
 	emailBody := smtpClient.GetEmailBody(msg, recipientEmails, s.cfg.Mode.IsBodyHTML, s.cfg.Mode.SendHiddenCopyToSelf)
 
-	// Извлекаем Message-ID из письма для последующего перемещения
+	// Извлекаем Message-ID из письма для последующей проверки bounce
 	messageID := extractMessageIDFromBody(emailBody)
 	if messageID == "" {
 		// Если не удалось извлечь, формируем как обычно
@@ -108,56 +98,12 @@ func (s *Service) SendEmail(ctx context.Context, msg *EmailMessage) error {
 		messageID = fmt.Sprintf("askemailsender%d@%s", msg.TaskID, smtpCfg.Host)
 	}
 
-	// Сохраняем письмо в папку "Outbox" ПЕРЕД отправкой (если IMAP настроен)
-	var outboxUID uint32
-	if smtpIndex < len(s.imapClients) && s.imapClients[smtpIndex] != nil {
-		uid, err := s.imapClients[smtpIndex].SaveToOutboxFolder(ctx, emailBody)
-		if err != nil {
-			if logger.Log != nil {
-				logger.Log.Warn("Ошибка сохранения письма в папку Outbox",
-					zap.Int64("taskID", msg.TaskID),
-					zap.Error(err))
-			}
-			// Продолжаем отправку даже если не удалось сохранить в Outbox
-		} else {
-			outboxUID = uid
-			if logger.Log != nil {
-				logger.Log.Debug("Письмо сохранено в папку Outbox",
-					zap.Int64("taskID", msg.TaskID),
-					zap.Uint32("uid", uid))
-			}
-		}
-	}
-
 	// Отправляем email с параметрами из конфигурации
 	if err := smtpClient.SendEmail(ctx, msg, testEmail, s.cfg.Mode.IsBodyHTML, s.cfg.Mode.SendHiddenCopyToSelf); err != nil {
-		// Если отправка не удалась, письмо остается в Outbox
 		return fmt.Errorf("ошибка отправки через SMTP: %w", err)
 	}
 
-	// После успешной отправки перемещаем письмо из Outbox в Sent (если IMAP настроен)
-	if smtpIndex < len(s.imapClients) && s.imapClients[smtpIndex] != nil {
-		// Перемещаем асинхронно, чтобы не блокировать
-		go func(imapClient *IMAPClient, uid uint32, msgID string) {
-			if err := imapClient.MoveToSentFolder(context.Background(), uid, msgID); err != nil {
-				if logger.Log != nil {
-					logger.Log.Warn("Ошибка перемещения письма из Outbox в Sent",
-						zap.Int64("taskID", msg.TaskID),
-						zap.Uint32("uid", uid),
-						zap.String("messageID", msgID),
-						zap.Error(err))
-				}
-			} else {
-				if logger.Log != nil {
-					logger.Log.Debug("Письмо перемещено из Outbox в Sent",
-						zap.Int64("taskID", msg.TaskID),
-						zap.Uint32("uid", uid))
-				}
-			}
-		}(s.imapClients[smtpIndex], outboxUID, messageID)
-	}
-
-	// Сохраняем информацию об отправленном письме для последующей проверки статуса
+	// Сохраняем информацию об отправленном письме для последующей проверки bounce
 	smtpCfg := &s.cfg.SMTP[smtpIndex]
 	// Message-ID должен совпадать с тем, что в заголовке письма
 	// В smtp.go он формируется как: <askemailsender%d@%s>
