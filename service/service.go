@@ -403,6 +403,24 @@ func (s *Service) sendMessage(ctx context.Context, msg *db.QueueMessage) {
 			continue
 		}
 
+		// Проверяем, что вложение не пустое
+		if attachData == nil {
+			logger.Log.Warn("Вложение обработано, но данные отсутствуют (nil)",
+				zap.Int64("taskID", emailMsg.TaskID),
+				zap.Int("reportType", attach.ReportType),
+				zap.String("fileName", attach.FileName))
+			continue
+		}
+
+		if len(attachData.Data) == 0 {
+			logger.Log.Warn("Вложение обработано, но данные пустые (размер 0 байт)",
+				zap.Int64("taskID", emailMsg.TaskID),
+				zap.Int("reportType", attach.ReportType),
+				zap.String("fileName", attachData.FileName))
+			// Не добавляем пустое вложение к письму
+			continue
+		}
+
 		logger.Log.Debug("Вложение успешно обработано",
 			zap.Int64("taskID", emailMsg.TaskID),
 			zap.String("fileName", attachData.FileName),
@@ -411,10 +429,31 @@ func (s *Service) sendMessage(ctx context.Context, msg *db.QueueMessage) {
 		attachmentData = append(attachmentData, *attachData)
 	}
 
-	logger.Log.Info("Обработка вложений завершена",
-		zap.Int64("taskID", emailMsg.TaskID),
-		zap.Int("totalParsed", len(attachments)),
-		zap.Int("totalProcessed", len(attachmentData)))
+	// Логируем итоговую статистику по вложениям
+	skippedCount := len(attachments) - len(attachmentData)
+	if skippedCount > 0 {
+		logger.Log.Warn("Некоторые вложения были пропущены",
+			zap.Int64("taskID", emailMsg.TaskID),
+			zap.Int("totalParsed", len(attachments)),
+			zap.Int("totalProcessed", len(attachmentData)),
+			zap.Int("skipped", skippedCount))
+	} else {
+		logger.Log.Info("Обработка вложений завершена",
+			zap.Int64("taskID", emailMsg.TaskID),
+			zap.Int("totalParsed", len(attachments)),
+			zap.Int("totalProcessed", len(attachmentData)))
+	}
+
+	// Логируем информацию перед отправкой
+	if len(attachmentData) == 0 && len(attachments) > 0 {
+		logger.Log.Warn("Все вложения были пропущены, письмо будет отправлено без вложений",
+			zap.Int64("taskID", emailMsg.TaskID),
+			zap.Int("totalAttachments", len(attachments)))
+	} else if len(attachmentData) > 0 {
+		logger.Log.Info("Отправка письма с вложениями",
+			zap.Int64("taskID", emailMsg.TaskID),
+			zap.Int("attachmentsCount", len(attachmentData)))
+	}
 
 	// Отправляем email
 	emailMsgForSend := &email.EmailMessage{

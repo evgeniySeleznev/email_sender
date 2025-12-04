@@ -221,6 +221,16 @@ func (c *SMTPClient) buildEmailMessage(msg *EmailMessage, recipientEmails []stri
 
 		// Добавляем вложения
 		for _, attach := range msg.Attachments {
+			// Проверяем, что вложение не пустое
+			if len(attach.Data) == 0 {
+				if logger.Log != nil {
+					logger.Log.Warn("Пропуск пустого вложения при формировании письма",
+						zap.Int64("taskID", msg.TaskID),
+						zap.String("fileName", attach.FileName))
+				}
+				continue
+			}
+
 			// Определяем MIME тип по расширению файла
 			ext := filepath.Ext(attach.FileName)
 			mimeType := mime.TypeByExtension(ext)

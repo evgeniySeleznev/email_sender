@@ -180,6 +180,18 @@ func (p *AttachmentProcessor) processCLOB(ctx context.Context, attach *Attachmen
 		return nil, fmt.Errorf("ошибка получения CLOB: %w", err)
 	}
 
+	// Проверяем, что CLOB не пустой
+	if len(clobData) == 0 {
+		return nil, fmt.Errorf("CLOB вложение пустое (размер 0 байт)")
+	}
+
+	if logger.Log != nil {
+		logger.Log.Debug("CLOB вложение успешно получено",
+			zap.Int64("taskID", taskID),
+			zap.Int64("clobID", *attach.ClobAttachID),
+			zap.Int("size", len(clobData)))
+	}
+
 	// CLOB уже декодирован из Base64 в GetEmailReportClob
 	return &AttachmentData{
 		FileName: attach.FileName,
@@ -237,6 +249,17 @@ func (p *AttachmentProcessor) processFile(ctx context.Context, attach *Attachmen
 		if err != nil {
 			return nil, fmt.Errorf("ошибка чтения файла: %w", err)
 		}
+	}
+
+	// Проверяем, что файл не пустой
+	if len(data) == 0 {
+		return nil, fmt.Errorf("файл вложения пустой (размер 0 байт): %s", attach.ReportFile)
+	}
+
+	if logger.Log != nil {
+		logger.Log.Debug("Файл вложения успешно прочитан",
+			zap.String("file", attach.ReportFile),
+			zap.Int("size", len(data)))
 	}
 
 	return &AttachmentData{
