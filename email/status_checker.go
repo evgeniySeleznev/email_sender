@@ -70,7 +70,7 @@ func (sc *StatusChecker) statusChecker(ctx context.Context) {
 				select {
 				case <-ctx.Done():
 					return
-				case <-time.After(30 * time.Second):
+				case <-time.After(30 * time.Minute):
 					sc.checkEmailStatus(ctx, info)
 				}
 			}(sentInfo)

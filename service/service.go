@@ -395,7 +395,13 @@ func (s *Service) sendMessage(ctx context.Context, msg *db.QueueMessage) {
 	if err != nil {
 		status = 3 // Failed
 		statusDesc = err.Error()
-		logger.Log.Error("Ошибка отправки email", zap.Error(err), zap.Int64("taskID", taskID))
+
+		// Для ошибок неверного email адреса логируем на уровне WARN
+		if s.isInvalidEmailError(err) {
+			logger.Log.Warn("Ошибка отправки email: неверный адрес", zap.Error(err), zap.Int64("taskID", taskID))
+		} else {
+			logger.Log.Error("Ошибка отправки email", zap.Error(err), zap.Int64("taskID", taskID))
+		}
 
 		// Проверяем на критические ошибки
 		if s.isCriticalError(err) {
@@ -523,6 +529,36 @@ func (s *Service) checkAndUpdateRateLimits(emailMsg *email.ParsedEmailMessage) e
 	}
 
 	return nil
+}
+
+// isInvalidEmailError проверяет, является ли ошибка ошибкой неверного email адреса
+func (s *Service) isInvalidEmailError(err error) bool {
+	if err == nil {
+		return false
+	}
+
+	errStr := strings.ToLower(err.Error())
+	// Проверяем типичные ошибки неверного email адреса
+	invalidEmailPatterns := []string{
+		"bad recipient address syntax",
+		"501 5.1.3",
+		"501",
+		"5.1.3",
+		"invalid email",
+		"invalid address",
+		"malformed address",
+		"неверный адрес",
+		"неверный email",
+		"ошибка установки получателя",
+	}
+
+	for _, pattern := range invalidEmailPatterns {
+		if strings.Contains(errStr, pattern) {
+			return true
+		}
+	}
+
+	return false
 }
 
 // isCriticalError проверяет, является ли ошибка критической
