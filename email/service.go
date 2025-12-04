@@ -100,7 +100,13 @@ func (s *Service) SendEmail(ctx context.Context, msg *EmailMessage) error {
 		SendTime:  time.Now(),
 	}
 
-	// Планируем проверку статуса через 5 минут
+	if logger.Log != nil {
+		logger.Log.Info("Планирование проверки статуса после отправки письма",
+			zap.Int64("taskID", msg.TaskID),
+			zap.String("messageID", messageID))
+	}
+
+	// Планируем проверку статуса через 30 секунд
 	s.statusChecker.ScheduleCheck(sentInfo)
 
 	return nil
@@ -139,35 +145,6 @@ func (s *Service) getTestEmail(ctx context.Context) string {
 // ProcessAttachment обрабатывает вложение и возвращает данные для отправки
 func (s *Service) ProcessAttachment(ctx context.Context, attach *Attachment, taskID int64) (*AttachmentData, error) {
 	return s.attachmentProcessor.ProcessAttachment(ctx, attach, taskID)
-}
-
-// LogIMAPFolders логирует список папок для всех настроенных IMAP серверов
-func (s *Service) LogIMAPFolders(ctx context.Context) {
-	for i, smtpCfg := range s.cfg.SMTP {
-		if smtpCfg.IMAPHost == "" {
-			continue
-		}
-
-		imapClient := NewIMAPClient(&smtpCfg)
-		folders, err := imapClient.ListFolders(ctx)
-		if err != nil {
-			if logger.Log != nil {
-				logger.Log.Warn("Ошибка получения списка папок IMAP",
-					zap.Int("smtpIndex", i),
-					zap.String("imapHost", smtpCfg.IMAPHost),
-					zap.Error(err))
-			}
-			continue
-		}
-
-		if logger.Log != nil {
-			logger.Log.Info("Список папок на IMAP сервере",
-				zap.Int("smtpIndex", i),
-				zap.String("imapHost", smtpCfg.IMAPHost),
-				zap.Int("foldersCount", len(folders)),
-				zap.Strings("folders", folders))
-		}
-	}
 }
 
 // EmailMessage представляет email сообщение для отправки

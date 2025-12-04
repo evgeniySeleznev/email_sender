@@ -41,16 +41,6 @@ func main() {
 	var allHandlersWg sync.WaitGroup
 	startMainService(ctx, mainService, &allHandlersWg)
 
-	// Запускаем логирование папок IMAP через 15 секунд после старта
-	go func() {
-		select {
-		case <-ctx.Done():
-			return
-		case <-time.After(15 * time.Second):
-			emailService.LogIMAPFolders(ctx)
-		}
-	}()
-
 	<-shutdownRequested
 	shutdown(ctx, cancel, mainService, emailService, dbConn, &allHandlersWg)
 }

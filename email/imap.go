@@ -73,8 +73,8 @@ func (c *IMAPClient) CheckEmailStatus(ctx context.Context, messageID string) (in
 	}
 
 	// Список возможных названий папок для исходящих и отправленных
-	outboxFolders := []string{"Исходящие", "Outbox", "Sent", "Отправленные", "Sent Items"}
-	sentFolders := []string{"Отправленные", "Sent", "Sent Items", "Sent Messages"}
+	outboxFolders := []string{"Исходящие", "Outbox"}
+	sentFolders := []string{"Отправленные", "Sent"}
 
 	// Проверяем папку "исходящие" (Outbox)
 	for _, folderName := range outboxFolders {
@@ -157,72 +157,4 @@ func (c *IMAPClient) checkFolderForMessage(imapClient *client.Client, folderName
 	}
 
 	return 0, fmt.Errorf("письмо не найдено")
-}
-
-// ListFolders возвращает список всех папок на IMAP сервере
-func (c *IMAPClient) ListFolders(ctx context.Context) ([]string, error) {
-	if c.cfg.IMAPHost == "" {
-		return nil, fmt.Errorf("IMAP не настроен")
-	}
-
-	// Подключаемся к IMAP серверу
-	addr := fmt.Sprintf("%s:%d", c.cfg.IMAPHost, c.cfg.IMAPPort)
-	var imapClient *client.Client
-	var err error
-
-	if c.cfg.IMAPPort == 993 {
-		// SSL/TLS соединение
-		imapClient, err = client.DialTLS(addr, &tls.Config{
-			ServerName:         c.cfg.IMAPHost,
-			InsecureSkipVerify: false,
-		})
-	} else {
-		// Обычное соединение с STARTTLS
-		imapClient, err = client.Dial(addr)
-		if err == nil {
-			// Пробуем STARTTLS
-			if err := imapClient.StartTLS(&tls.Config{
-				ServerName:         c.cfg.IMAPHost,
-				InsecureSkipVerify: false,
-			}); err != nil {
-				imapClient.Logout()
-				return nil, fmt.Errorf("ошибка STARTTLS: %w", err)
-			}
-		}
-	}
-
-	if err != nil {
-		return nil, fmt.Errorf("ошибка подключения к IMAP: %w", err)
-	}
-	defer imapClient.Logout()
-
-	// Аутентификация
-	if err := imapClient.Login(c.cfg.User, c.cfg.Password); err != nil {
-		return nil, fmt.Errorf("ошибка аутентификации IMAP: %w", err)
-	}
-
-	// Получаем список папок
-	mailboxes := make(chan *imap.MailboxInfo, 10)
-	done := make(chan error, 1)
-
-	go func() {
-		done <- imapClient.List("", "*", mailboxes)
-	}()
-
-	var folders []string
-	for {
-		select {
-		case <-ctx.Done():
-			return nil, ctx.Err()
-		case err := <-done:
-			if err != nil {
-				return nil, fmt.Errorf("ошибка получения списка папок: %w", err)
-			}
-			return folders, nil
-		case m := <-mailboxes:
-			if m != nil {
-				folders = append(folders, m.Name)
-			}
-		}
-	}
 }
