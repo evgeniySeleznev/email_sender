@@ -1,6 +1,7 @@
 package email
 
 import (
+	"bytes"
 	"context"
 	"crypto/tls"
 	"fmt"
@@ -32,8 +33,100 @@ func NewIMAPClient(cfg *settings.SMTPConfig) *IMAPClient {
 	}
 }
 
-// SaveToSentFolder сохраняет письмо в папку "Sent" через IMAP APPEND
-func (c *IMAPClient) SaveToSentFolder(ctx context.Context, emailBody string) error {
+// SaveToOutboxFolder сохраняет письмо в папку "Outbox" (Исходящие) через IMAP APPEND
+// Возвращает UID сохраненного письма для последующего перемещения
+func (c *IMAPClient) SaveToOutboxFolder(ctx context.Context, emailBody string) (uint32, error) {
+	if c.cfg.IMAPHost == "" {
+		return 0, fmt.Errorf("IMAP не настроен")
+	}
+
+	// Подключаемся к IMAP серверу
+	addr := fmt.Sprintf("%s:%d", c.cfg.IMAPHost, c.cfg.IMAPPort)
+	var imapClient *client.Client
+	var err error
+
+	if c.cfg.IMAPPort == 993 {
+		// SSL/TLS соединение
+		imapClient, err = client.DialTLS(addr, &tls.Config{
+			ServerName:         c.cfg.IMAPHost,
+			InsecureSkipVerify: false,
+		})
+	} else {
+		// Обычное соединение с STARTTLS
+		imapClient, err = client.Dial(addr)
+		if err == nil {
+			// Пробуем STARTTLS
+			if err := imapClient.StartTLS(&tls.Config{
+				ServerName:         c.cfg.IMAPHost,
+				InsecureSkipVerify: false,
+			}); err != nil {
+				imapClient.Logout()
+				return 0, fmt.Errorf("ошибка STARTTLS: %w", err)
+			}
+		}
+	}
+
+	if err != nil {
+		return 0, fmt.Errorf("ошибка подключения к IMAP: %w", err)
+	}
+	defer imapClient.Logout()
+
+	// Аутентификация
+	if err := imapClient.Login(c.cfg.User, c.cfg.Password); err != nil {
+		return 0, fmt.Errorf("ошибка аутентификации IMAP: %w", err)
+	}
+
+	// Пробуем найти папку "Outbox" (разные варианты названий)
+	outboxFolders := []string{"Outbox", "Исходящие"}
+	var selectedFolder string
+
+	for _, folderName := range outboxFolders {
+		_, err := imapClient.Select(folderName, false)
+		if err == nil {
+			selectedFolder = folderName
+			break
+		}
+	}
+
+	if selectedFolder == "" {
+		// Если папка не найдена, пробуем использовать INBOX
+		if logger.Log != nil {
+			logger.Log.Warn("Папка Outbox не найдена, пробуем использовать INBOX")
+		}
+		selectedFolder = "INBOX"
+	}
+
+	// Сохраняем письмо в папку через APPEND
+	// emailBody уже содержит полное письмо с заголовками и телом
+	messageBytes := []byte(emailBody)
+
+	// Добавляем флаги (письмо еще не отправлено)
+	flags := []string{}
+
+	// Добавляем дату создания (текущее время)
+	date := time.Now()
+
+	// APPEND сохраняет письмо в папку
+	if err := imapClient.Append(selectedFolder, flags, date, bytes.NewReader(messageBytes)); err != nil {
+		return 0, fmt.Errorf("ошибка сохранения письма в папку '%s': %w", selectedFolder, err)
+	}
+
+	// Получаем UID только что сохраненного письма по Message-ID
+	messageID := extractMessageID(emailBody)
+	if messageID == "" {
+		return 0, nil
+	}
+
+	uid, err := c.findMessageUID(imapClient, selectedFolder, messageID)
+	if err != nil {
+		return 0, nil
+	}
+
+	return uid, nil
+}
+
+// MoveToSentFolder перемещает письмо из папки "Outbox" в папку "Sent" по UID
+func (c *IMAPClient) MoveToSentFolder(ctx context.Context, outboxUID uint32, messageID string) error {
 	if c.cfg.IMAPHost == "" {
 		return fmt.Errorf("IMAP не настроен")
 	}
@@ -74,46 +167,165 @@ func (c *IMAPClient) SaveToSentFolder(ctx context.Context, emailBody string) err
 		return fmt.Errorf("ошибка аутентификации IMAP: %w", err)
 	}
 
-	// Пробуем найти папку "Sent" (разные варианты названий)
+	// Находим папки Outbox и Sent
+	outboxFolders := []string{"Outbox", "Исходящие"}
 	sentFolders := []string{"Sent", "Отправленные", "Sent Items"}
-	var selectedFolder string
-	
-	for _, folderName := range sentFolders {
+
+	var outboxFolder, sentFolder string
+
+	for _, folderName := range outboxFolders {
 		_, err := imapClient.Select(folderName, false)
 		if err == nil {
-			selectedFolder = folderName
+			outboxFolder = folderName
 			break
 		}
 	}
 
-	if selectedFolder == "" {
-		// Если папка не найдена, пробуем создать или использовать INBOX
-		if logger.Log != nil {
-			logger.Log.Warn("Папка Sent не найдена, пробуем использовать INBOX")
+	for _, folderName := range sentFolders {
+		_, err := imapClient.Select(folderName, false)
+		if err == nil {
+			sentFolder = folderName
+			break
 		}
-		selectedFolder = "INBOX"
 	}
 
-	// Сохраняем письмо в папку через APPEND
-	// emailBody уже содержит полное письмо с заголовками и телом
-	messageLiteral := imap.NewLiteral([]byte(emailBody))
-	
-	// Добавляем флаги (например, \Seen - прочитано, но для Sent обычно не нужно)
-	flags := []string{}
-	
-	// Добавляем дату отправки (текущее время)
-	date := time.Now()
-	
-	if err := imapClient.Append(selectedFolder, flags, date, messageLiteral); err != nil {
-		return fmt.Errorf("ошибка сохранения письма в папку '%s': %w", selectedFolder, err)
+	if outboxFolder == "" {
+		return fmt.Errorf("папка Outbox не найдена")
+	}
+	if sentFolder == "" {
+		return fmt.Errorf("папка Sent не найдена")
+	}
+
+	// Если UID неизвестен (0), ищем письмо по Message-ID
+	if outboxUID == 0 {
+		uid, err := c.findMessageUID(imapClient, outboxFolder, messageID)
+		if err != nil {
+			return fmt.Errorf("не удалось найти письмо по Message-ID '%s': %w", messageID, err)
+		}
+		outboxUID = uid
+	}
+
+	// Выбираем папку Outbox
+	_, err = imapClient.Select(outboxFolder, false)
+	if err != nil {
+		return fmt.Errorf("ошибка выбора папки Outbox: %w", err)
+	}
+
+	// Создаем SeqSet с UID письма
+	seqSet := new(imap.SeqSet)
+	seqSet.AddNum(outboxUID)
+
+	// Копируем письмо в Sent используя UID
+	if err := imapClient.UidCopy(seqSet, sentFolder); err != nil {
+		return fmt.Errorf("ошибка копирования письма в папку Sent: %w", err)
+	}
+
+	// Помечаем оригинал как удаленный используя UID
+	item := imap.FormatFlagsOp(imap.AddFlags, true)
+	flags := []interface{}{imap.DeletedFlag}
+	if err := imapClient.UidStore(seqSet, item, flags, nil); err != nil {
+		return fmt.Errorf("ошибка пометки письма как удаленного: %w", err)
+	}
+
+	// Удаляем помеченные письма
+	if err := imapClient.Expunge(nil); err != nil {
+		return fmt.Errorf("ошибка удаления письма из Outbox: %w", err)
 	}
 
 	if logger.Log != nil {
-		logger.Log.Debug("Письмо сохранено в папку Sent",
-			zap.String("folder", selectedFolder))
+		logger.Log.Debug("Письмо перемещено из Outbox в Sent",
+			zap.String("outboxFolder", outboxFolder),
+			zap.String("sentFolder", sentFolder),
+			zap.Uint32("uid", outboxUID),
+			zap.String("messageID", messageID))
 	}
 
 	return nil
+}
+
+// findMessageUID находит UID письма по Message-ID в указанной папке
+func (c *IMAPClient) findMessageUID(imapClient *client.Client, folderName, messageID string) (uint32, error) {
+	// Выбираем папку
+	_, err := imapClient.Select(folderName, false)
+	if err != nil {
+		return 0, err
+	}
+
+	messageIDClean := strings.Trim(messageID, "<>")
+	messageIDForSearch := "<" + messageIDClean + ">"
+
+	// Пробуем поиск через SEARCH
+	criteria := imap.NewSearchCriteria()
+	criteria.Header.Add("Message-ID", messageIDForSearch)
+
+	ids, err := imapClient.Search(criteria)
+	if err == nil && len(ids) > 0 {
+		// Возвращаем первый найденный UID
+		return ids[0], nil
+	}
+
+	// Если SEARCH не сработал, используем ручную проверку последних писем
+	mailboxStatus, err := imapClient.Status(folderName, []imap.StatusItem{imap.StatusMessages})
+	if err != nil {
+		return 0, err
+	}
+
+	if mailboxStatus.Messages == 0 {
+		return 0, fmt.Errorf("папка пуста")
+	}
+
+	maxMessages := uint32(50) // Проверяем последние 50 писем
+	if mailboxStatus.Messages < maxMessages {
+		maxMessages = mailboxStatus.Messages
+	}
+
+	seqSet := new(imap.SeqSet)
+	seqSet.AddRange(mailboxStatus.Messages-maxMessages+1, mailboxStatus.Messages)
+
+	items := []imap.FetchItem{imap.FetchEnvelope, imap.FetchUid}
+
+	messages := make(chan *imap.Message, 10)
+	done := make(chan error, 1)
+
+	go func() {
+		done <- imapClient.Fetch(seqSet, items, messages)
+	}()
+
+	for {
+		select {
+		case err := <-done:
+			if err != nil {
+				return 0, err
+			}
+			return 0, fmt.Errorf("письмо с Message-ID '%s' не найдено", messageIDForSearch)
+		case msg := <-messages:
+			if msg == nil {
+				continue
+			}
+
+			if msg.Envelope != nil && msg.Envelope.MessageId != "" {
+				envelopeMsgID := strings.Trim(msg.Envelope.MessageId, "<>")
+				if envelopeMsgID == messageIDClean {
+					return msg.Uid, nil
+				}
+			}
+		}
+	}
+}
+
+// extractMessageID извлекает Message-ID из тела письма
+func extractMessageID(emailBody string) string {
+	lines := strings.Split(emailBody, "\n")
+	for _, line := range lines {
+		line = strings.TrimSpace(line)
+		if strings.HasPrefix(strings.ToLower(line), "message-id:") {
+			parts := strings.SplitN(line, ":", 2)
+			if len(parts) == 2 {
+				return strings.TrimSpace(parts[1])
+			}
+		}
+	}
+	return ""
 }
 
 // CheckEmailStatus проверяет статус письма по Message-ID в папках "исходящие" и "отправленные"
@@ -159,60 +371,19 @@ func (c *IMAPClient) CheckEmailStatus(ctx context.Context, messageID string) (in
 		return 0, "", fmt.Errorf("ошибка аутентификации IMAP: %w", err)
 	}
 
-	// Список возможных названий папок для исходящих и отправленных
-	// Для Yandex обычно используются: "Отправленные" (Sent), "Исходящие" (Outbox)
-	// Но на английском могут быть: "Sent", "Outbox", "Sent Items"
-	outboxFolders := []string{"Outbox", "Исходящие"}
+	// Проверяем только папку "отправленные" (Sent)
 	sentFolders := []string{"Sent", "Отправленные", "Sent Items"}
 
-	// Логируем Message-ID для отладки
-	if logger.Log != nil {
-		logger.Log.Debug("Поиск письма по Message-ID",
-			zap.String("messageID", messageID),
-			zap.String("messageIDClean", strings.Trim(messageID, "<>")),
-			zap.String("messageIDForSearch", "<"+strings.Trim(messageID, "<>")+">"))
-	}
-
-	// Проверяем папку "исходящие" (Outbox)
-	for _, folderName := range outboxFolders {
-		status, err := c.checkFolderForMessage(imapClient, folderName, messageID)
-		if err == nil && status > 0 {
-			if status == 3 {
-				// Найдено в исходящих с ошибкой
-				return 3, fmt.Sprintf("Письмо найдено в папке '%s' с ошибкой отправки", folderName), nil
-			}
-			// Найдено в исходящих без ошибки - еще не отправлено
-			return 0, "", nil
-		}
-		// Логируем ошибки для отладки (кроме "папка не существует")
-		if err != nil && logger.Log != nil {
-			if !strings.Contains(err.Error(), "не существует") && !strings.Contains(err.Error(), "not found") {
-				logger.Log.Debug("Ошибка проверки папки исходящих",
-					zap.String("folder", folderName),
-					zap.Error(err))
-			}
-		}
-	}
-
-	// Проверяем папку "отправленные" (Sent)
 	for _, folderName := range sentFolders {
 		status, err := c.checkFolderForMessage(imapClient, folderName, messageID)
 		if err == nil && status > 0 {
 			// Найдено в отправленных - успешно отправлено
 			return 4, fmt.Sprintf("Письмо найдено в папке '%s'", folderName), nil
 		}
-		// Логируем ошибки для отладки (кроме "папка не существует")
-		if err != nil && logger.Log != nil {
-			if !strings.Contains(err.Error(), "не существует") && !strings.Contains(err.Error(), "not found") {
-				logger.Log.Debug("Ошибка проверки папки отправленных",
-					zap.String("folder", folderName),
-					zap.Error(err))
-			}
-		}
 	}
 
-	// Не найдено ни в одной папке
-	return 0, "", nil
+	// Не найдено в Sent - ошибка отправки
+	return 3, "Письмо не найдено в папке Sent", nil
 }
 
 // checkFolderForMessage проверяет наличие письма в указанной папке по Message-ID
@@ -233,35 +404,13 @@ func (c *IMAPClient) checkFolderForMessage(imapClient *client.Client, folderName
 	// IMAP SEARCH HEADER ищет точное совпадение в заголовке
 	messageIDForSearch := "<" + messageIDClean + ">"
 
-	// Логируем для отладки
-	if logger.Log != nil {
-		logger.Log.Debug("Поиск письма в папке",
-			zap.String("folder", folderName),
-			zap.String("messageIDOriginal", messageID),
-			zap.String("messageIDClean", messageIDClean),
-			zap.String("messageIDForSearch", messageIDForSearch))
-	}
-
 	// Пробуем поиск через SEARCH команду
-	// Если не работает (например, "SEARCH Backend error" от Yandex), используем ручную проверку
-	var ids []uint32
-	var searchErr error
-
-	// Вариант 1: Поиск по HEADER с угловыми скобками
 	criteria := imap.NewSearchCriteria()
 	criteria.Header.Add("Message-ID", messageIDForSearch)
-	ids, searchErr = imapClient.Search(criteria)
+	ids, err := imapClient.Search(criteria)
 
-	// Если поиск не удался из-за ошибки сервера, переходим к ручной проверке
-	if searchErr != nil || len(ids) == 0 {
-		if searchErr != nil {
-			if logger.Log != nil {
-				logger.Log.Debug("SEARCH команда не работает, используем ручную проверку",
-					zap.String("folder", folderName),
-					zap.Error(searchErr))
-			}
-		}
-
+	// Если поиск не удался, используем ручную проверку
+	if err != nil || len(ids) == 0 {
 		// Ручная проверка: получаем последние письма и проверяем их Message-ID
 		mailboxStatus, err := imapClient.Status(folderName, []imap.StatusItem{imap.StatusMessages})
 		if err != nil {
@@ -272,7 +421,7 @@ func (c *IMAPClient) checkFolderForMessage(imapClient *client.Client, folderName
 			return 0, fmt.Errorf("папка пуста")
 		}
 
-		// Получаем последние 100 писем (достаточно для недавно отправленных)
+		// Получаем последние 100 писем
 		maxMessages := uint32(100)
 		if mailboxStatus.Messages < maxMessages {
 			maxMessages = mailboxStatus.Messages
@@ -281,9 +430,7 @@ func (c *IMAPClient) checkFolderForMessage(imapClient *client.Client, folderName
 		seqSet := new(imap.SeqSet)
 		seqSet.AddRange(mailboxStatus.Messages-maxMessages+1, mailboxStatus.Messages)
 
-		// Получаем только Envelope (быстрее, чем полное тело)
 		items := []imap.FetchItem{imap.FetchEnvelope}
-
 		messages := make(chan *imap.Message, 10)
 		done := make(chan error, 1)
 
@@ -291,29 +438,20 @@ func (c *IMAPClient) checkFolderForMessage(imapClient *client.Client, folderName
 			done <- imapClient.Fetch(seqSet, items, messages)
 		}()
 
-		// Проверяем каждое письмо
 		for {
 			select {
 			case err := <-done:
 				if err != nil {
 					return 0, fmt.Errorf("ошибка получения писем: %w", err)
 				}
-				// Все письма проверены, не найдено
-				return 0, fmt.Errorf("письмо не найдено в папке '%s' по Message-ID '%s'", folderName, messageIDForSearch)
+				return 0, fmt.Errorf("письмо не найдено")
 			case msg := <-messages:
 				if msg == nil {
 					continue
 				}
-
-				// Проверяем Message-ID из Envelope
 				if msg.Envelope != nil && msg.Envelope.MessageId != "" {
 					envelopeMsgID := strings.Trim(msg.Envelope.MessageId, "<>")
 					if envelopeMsgID == messageIDClean {
-						if logger.Log != nil {
-							logger.Log.Debug("Письмо найдено через проверку Envelope",
-								zap.String("folder", folderName),
-								zap.String("messageID", messageIDClean))
-						}
 						return 1, nil
 					}
 				}
@@ -321,14 +459,6 @@ func (c *IMAPClient) checkFolderForMessage(imapClient *client.Client, folderName
 		}
 	}
 
-	// SEARCH сработал, письмо найдено
-	if logger.Log != nil {
-		logger.Log.Debug("Письмо найдено через SEARCH",
-			zap.String("folder", folderName),
-			zap.String("messageID", messageIDForSearch),
-			zap.Int("foundCount", len(ids)))
-	}
-
-	// Письмо найдено через SEARCH, возвращаем успех
+	// Письмо найдено через SEARCH
 	return 1, nil
 }

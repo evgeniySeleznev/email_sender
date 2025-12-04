@@ -96,40 +96,76 @@ func (s *Service) SendEmail(ctx context.Context, msg *EmailMessage) error {
 
 	smtpClient := s.smtpClients[smtpIndex]
 
-	// Получаем тело письма для сохранения в папку Sent
+	// Получаем тело письма для сохранения в папку Outbox
 	recipientEmails := smtpClient.parseEmailAddresses(msg.EmailAddress, testEmail)
 	emailBody := smtpClient.GetEmailBody(msg, recipientEmails, s.cfg.Mode.IsBodyHTML, s.cfg.Mode.SendHiddenCopyToSelf)
 
+	// Извлекаем Message-ID из письма для последующего перемещения
+	messageID := extractMessageIDFromBody(emailBody)
+	if messageID == "" {
+		// Если не удалось извлечь, формируем как обычно
+		smtpCfg := &s.cfg.SMTP[smtpIndex]
+		messageID = fmt.Sprintf("askemailsender%d@%s", msg.TaskID, smtpCfg.Host)
+	}
+
+	// Сохраняем письмо в папку "Outbox" ПЕРЕД отправкой (если IMAP настроен)
+	var outboxUID uint32
+	if smtpIndex < len(s.imapClients) && s.imapClients[smtpIndex] != nil {
+		uid, err := s.imapClients[smtpIndex].SaveToOutboxFolder(ctx, emailBody)
+		if err != nil {
+			if logger.Log != nil {
+				logger.Log.Warn("Ошибка сохранения письма в папку Outbox",
+					zap.Int64("taskID", msg.TaskID),
+					zap.Error(err))
+			}
+			// Продолжаем отправку даже если не удалось сохранить в Outbox
+		} else {
+			outboxUID = uid
+			if logger.Log != nil {
+				logger.Log.Debug("Письмо сохранено в папку Outbox",
+					zap.Int64("taskID", msg.TaskID),
+					zap.Uint32("uid", uid))
+			}
+		}
+	}
+
 	// Отправляем email с параметрами из конфигурации
 	if err := smtpClient.SendEmail(ctx, msg, testEmail, s.cfg.Mode.IsBodyHTML, s.cfg.Mode.SendHiddenCopyToSelf); err != nil {
+		// Если отправка не удалась, письмо остается в Outbox
 		return fmt.Errorf("ошибка отправки через SMTP: %w", err)
 	}
 
-	// Сохраняем письмо в папку "Sent" через IMAP (если IMAP настроен)
+	// После успешной отправки перемещаем письмо из Outbox в Sent (если IMAP настроен)
 	if smtpIndex < len(s.imapClients) && s.imapClients[smtpIndex] != nil {
-		// Сохраняем асинхронно, чтобы не блокировать отправку
-		go func(imapClient *IMAPClient, body string) {
-			if err := imapClient.SaveToSentFolder(context.Background(), body); err != nil {
+		// Перемещаем асинхронно, чтобы не блокировать
+		go func(imapClient *IMAPClient, uid uint32, msgID string) {
+			if err := imapClient.MoveToSentFolder(context.Background(), uid, msgID); err != nil {
 				if logger.Log != nil {
-					logger.Log.Warn("Ошибка сохранения письма в папку Sent",
+					logger.Log.Warn("Ошибка перемещения письма из Outbox в Sent",
 						zap.Int64("taskID", msg.TaskID),
+						zap.Uint32("uid", uid),
+						zap.String("messageID", msgID),
 						zap.Error(err))
 				}
 			} else {
 				if logger.Log != nil {
-					logger.Log.Debug("Письмо сохранено в папку Sent",
-						zap.Int64("taskID", msg.TaskID))
+					logger.Log.Debug("Письмо перемещено из Outbox в Sent",
+						zap.Int64("taskID", msg.TaskID),
+						zap.Uint32("uid", uid))
 				}
 			}
-		}(s.imapClients[smtpIndex], emailBody)
+		}(s.imapClients[smtpIndex], outboxUID, messageID)
 	}
 
 	// Сохраняем информацию об отправленном письме для последующей проверки статуса
 	smtpCfg := &s.cfg.SMTP[smtpIndex]
 	// Message-ID должен совпадать с тем, что в заголовке письма
 	// В smtp.go он формируется как: <askemailsender%d@%s>
-	// Поэтому здесь тоже используем тот же формат (без угловых скобок, они добавятся при поиске)
-	messageID := fmt.Sprintf("askemailsender%d@%s", msg.TaskID, smtpCfg.Host)
+	// Используем Message-ID, который мы уже извлекли из тела письма выше
+	// Если он не был извлечен, формируем как обычно
+	if messageID == "" {
+		messageID = fmt.Sprintf("askemailsender%d@%s", msg.TaskID, smtpCfg.Host)
+	}
 	sentInfo := &SentEmailInfo{
 		TaskID:    msg.TaskID,
 		SmtpID:    msg.SmtpID,
@@ -198,4 +234,19 @@ type EmailMessage struct {
 type AttachmentData struct {
 	FileName string
 	Data     []byte
+}
+
+// extractMessageIDFromBody извлекает Message-ID из тела письма
+func extractMessageIDFromBody(emailBody string) string {
+	lines := strings.Split(emailBody, "\n")
+	for _, line := range lines {
+		line = strings.TrimSpace(line)
+		if strings.HasPrefix(strings.ToLower(line), "message-id:") {
+			parts := strings.SplitN(line, ":", 2)
+			if len(parts) == 2 {
+				return strings.TrimSpace(parts[1])
+			}
+		}
+	}
+	return ""
 }
