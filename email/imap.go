@@ -32,6 +32,90 @@ func NewIMAPClient(cfg *settings.SMTPConfig) *IMAPClient {
 	}
 }
 
+// SaveToSentFolder сохраняет письмо в папку "Sent" через IMAP APPEND
+func (c *IMAPClient) SaveToSentFolder(ctx context.Context, emailBody string) error {
+	if c.cfg.IMAPHost == "" {
+		return fmt.Errorf("IMAP не настроен")
+	}
+
+	// Подключаемся к IMAP серверу
+	addr := fmt.Sprintf("%s:%d", c.cfg.IMAPHost, c.cfg.IMAPPort)
+	var imapClient *client.Client
+	var err error
+
+	if c.cfg.IMAPPort == 993 {
+		// SSL/TLS соединение
+		imapClient, err = client.DialTLS(addr, &tls.Config{
+			ServerName:         c.cfg.IMAPHost,
+			InsecureSkipVerify: false,
+		})
+	} else {
+		// Обычное соединение с STARTTLS
+		imapClient, err = client.Dial(addr)
+		if err == nil {
+			// Пробуем STARTTLS
+			if err := imapClient.StartTLS(&tls.Config{
+				ServerName:         c.cfg.IMAPHost,
+				InsecureSkipVerify: false,
+			}); err != nil {
+				imapClient.Logout()
+				return fmt.Errorf("ошибка STARTTLS: %w", err)
+			}
+		}
+	}
+
+	if err != nil {
+		return fmt.Errorf("ошибка подключения к IMAP: %w", err)
+	}
+	defer imapClient.Logout()
+
+	// Аутентификация
+	if err := imapClient.Login(c.cfg.User, c.cfg.Password); err != nil {
+		return fmt.Errorf("ошибка аутентификации IMAP: %w", err)
+	}
+
+	// Пробуем найти папку "Sent" (разные варианты названий)
+	sentFolders := []string{"Sent", "Отправленные", "Sent Items"}
+	var selectedFolder string
+	
+	for _, folderName := range sentFolders {
+		_, err := imapClient.Select(folderName, false)
+		if err == nil {
+			selectedFolder = folderName
+			break
+		}
+	}
+
+	if selectedFolder == "" {
+		// Если папка не найдена, пробуем создать или использовать INBOX
+		if logger.Log != nil {
+			logger.Log.Warn("Папка Sent не найдена, пробуем использовать INBOX")
+		}
+		selectedFolder = "INBOX"
+	}
+
+	// Сохраняем письмо в папку через APPEND
+	// emailBody уже содержит полное письмо с заголовками и телом
+	messageLiteral := imap.NewLiteral([]byte(emailBody))
+	
+	// Добавляем флаги (например, \Seen - прочитано, но для Sent обычно не нужно)
+	flags := []string{}
+	
+	// Добавляем дату отправки (текущее время)
+	date := time.Now()
+	
+	if err := imapClient.Append(selectedFolder, flags, date, messageLiteral); err != nil {
+		return fmt.Errorf("ошибка сохранения письма в папку '%s': %w", selectedFolder, err)
+	}
+
+	if logger.Log != nil {
+		logger.Log.Debug("Письмо сохранено в папку Sent",
+			zap.String("folder", selectedFolder))
+	}
+
+	return nil
+}
+
 // CheckEmailStatus проверяет статус письма по Message-ID в папках "исходящие" и "отправленные"
 // Возвращает status (0 - не найдено, 3 - ошибка, 4 - отправлено), описание и ошибку
 func (c *IMAPClient) CheckEmailStatus(ctx context.Context, messageID string) (int, string, error) {

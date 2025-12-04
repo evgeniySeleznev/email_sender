@@ -3,6 +3,7 @@ package email
 import (
 	"context"
 	"fmt"
+	"strings"
 	"sync"
 	"time"
 
@@ -18,6 +19,7 @@ type Service struct {
 	cfg                 *settings.Config
 	dbConn              *db.DBConnection
 	smtpClients         []*SMTPClient
+	imapClients         []*IMAPClient // IMAP клиенты для сохранения в Sent
 	attachmentProcessor *AttachmentProcessor
 	testEmail           string
 	testEmailCacheTime  time.Time
@@ -32,15 +34,24 @@ type Service struct {
 func NewService(cfg *settings.Config, dbConn *db.DBConnection, statusCallback StatusUpdateCallback) (*Service, error) {
 	// Создаем SMTP клиенты для каждого SMTP сервера
 	smtpClients := make([]*SMTPClient, 0, len(cfg.SMTP))
+	imapClients := make([]*IMAPClient, 0, len(cfg.SMTP))
 	for i := range cfg.SMTP {
-		client := NewSMTPClient(&cfg.SMTP[i])
-		smtpClients = append(smtpClients, client)
+		smtpClient := NewSMTPClient(&cfg.SMTP[i])
+		smtpClients = append(smtpClients, smtpClient)
+		// Создаем IMAP клиент для сохранения в Sent (если IMAP настроен)
+		if cfg.SMTP[i].IMAPHost != "" {
+			imapClient := NewIMAPClient(&cfg.SMTP[i])
+			imapClients = append(imapClients, imapClient)
+		} else {
+			imapClients = append(imapClients, nil)
+		}
 	}
 
 	service := &Service{
 		cfg:                 cfg,
 		dbConn:              dbConn,
 		smtpClients:         smtpClients,
+		imapClients:         imapClients,
 		attachmentProcessor: NewAttachmentProcessor(dbConn),
 		testEmailCacheTTL:   5 * time.Minute, // Кеш тестового email на 5 минут
 		statusChecker:       NewStatusChecker(cfg, statusCallback),
@@ -85,9 +96,32 @@ func (s *Service) SendEmail(ctx context.Context, msg *EmailMessage) error {
 
 	smtpClient := s.smtpClients[smtpIndex]
 
+	// Получаем тело письма для сохранения в папку Sent
+	recipientEmails := smtpClient.parseEmailAddresses(msg.EmailAddress, testEmail)
+	emailBody := smtpClient.GetEmailBody(msg, recipientEmails, s.cfg.Mode.IsBodyHTML, s.cfg.Mode.SendHiddenCopyToSelf)
+
 	// Отправляем email с параметрами из конфигурации
 	if err := smtpClient.SendEmail(ctx, msg, testEmail, s.cfg.Mode.IsBodyHTML, s.cfg.Mode.SendHiddenCopyToSelf); err != nil {
 		return fmt.Errorf("ошибка отправки через SMTP: %w", err)
+	}
+
+	// Сохраняем письмо в папку "Sent" через IMAP (если IMAP настроен)
+	if smtpIndex < len(s.imapClients) && s.imapClients[smtpIndex] != nil {
+		// Сохраняем асинхронно, чтобы не блокировать отправку
+		go func(imapClient *IMAPClient, body string) {
+			if err := imapClient.SaveToSentFolder(context.Background(), body); err != nil {
+				if logger.Log != nil {
+					logger.Log.Warn("Ошибка сохранения письма в папку Sent",
+						zap.Int64("taskID", msg.TaskID),
+						zap.Error(err))
+				}
+			} else {
+				if logger.Log != nil {
+					logger.Log.Debug("Письмо сохранено в папку Sent",
+						zap.Int64("taskID", msg.TaskID))
+				}
+			}
+		}(s.imapClients[smtpIndex], emailBody)
 	}
 
 	// Сохраняем информацию об отправленном письме для последующей проверки статуса

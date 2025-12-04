@@ -116,6 +116,11 @@ func (c *SMTPClient) SendEmail(ctx context.Context, msg *EmailMessage, testEmail
 	return nil
 }
 
+// GetEmailBody возвращает тело письма для сохранения в папку Sent
+func (c *SMTPClient) GetEmailBody(msg *EmailMessage, recipientEmails []string, isBodyHTML bool, sendHiddenCopyToSelf bool) string {
+	return c.buildEmailMessage(msg, recipientEmails, isBodyHTML, sendHiddenCopyToSelf)
+}
+
 // parseEmailAddresses парсит email адреса с поддержкой разделителей ; и ,
 func (c *SMTPClient) parseEmailAddresses(emailAddresses string, testEmail string) []string {
 	if testEmail != "" {
