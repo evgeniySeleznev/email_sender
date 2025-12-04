@@ -8,6 +8,9 @@ import (
 	"sync"
 	"time"
 
+	"go.uber.org/zap"
+
+	"email-service/logger"
 	"email-service/settings"
 
 	"github.com/emersion/go-imap"
@@ -73,8 +76,18 @@ func (c *IMAPClient) CheckEmailStatus(ctx context.Context, messageID string) (in
 	}
 
 	// Список возможных названий папок для исходящих и отправленных
-	outboxFolders := []string{"Исходящие", "Outbox"}
-	sentFolders := []string{"Отправленные", "Sent"}
+	// Для Yandex обычно используются: "Отправленные" (Sent), "Исходящие" (Outbox)
+	// Но на английском могут быть: "Sent", "Outbox", "Sent Items"
+	outboxFolders := []string{"Outbox", "Исходящие"}
+	sentFolders := []string{"Sent", "Отправленные", "Sent Items"}
+
+	// Логируем Message-ID для отладки
+	if logger.Log != nil {
+		logger.Log.Debug("Поиск письма по Message-ID",
+			zap.String("messageID", messageID),
+			zap.String("messageIDClean", strings.Trim(messageID, "<>")),
+			zap.String("messageIDForSearch", "<"+strings.Trim(messageID, "<>")+">"))
+	}
 
 	// Проверяем папку "исходящие" (Outbox)
 	for _, folderName := range outboxFolders {
@@ -87,6 +100,14 @@ func (c *IMAPClient) CheckEmailStatus(ctx context.Context, messageID string) (in
 			// Найдено в исходящих без ошибки - еще не отправлено
 			return 0, "", nil
 		}
+		// Логируем ошибки для отладки (кроме "папка не существует")
+		if err != nil && logger.Log != nil {
+			if !strings.Contains(err.Error(), "не существует") && !strings.Contains(err.Error(), "not found") {
+				logger.Log.Debug("Ошибка проверки папки исходящих",
+					zap.String("folder", folderName),
+					zap.Error(err))
+			}
+		}
 	}
 
 	// Проверяем папку "отправленные" (Sent)
@@ -95,6 +116,14 @@ func (c *IMAPClient) CheckEmailStatus(ctx context.Context, messageID string) (in
 		if err == nil && status > 0 {
 			// Найдено в отправленных - успешно отправлено
 			return 4, fmt.Sprintf("Письмо найдено в папке '%s'", folderName), nil
+		}
+		// Логируем ошибки для отладки (кроме "папка не существует")
+		if err != nil && logger.Log != nil {
+			if !strings.Contains(err.Error(), "не существует") && !strings.Contains(err.Error(), "not found") {
+				logger.Log.Debug("Ошибка проверки папки отправленных",
+					zap.String("folder", folderName),
+					zap.Error(err))
+			}
 		}
 	}
 
@@ -113,48 +142,109 @@ func (c *IMAPClient) checkFolderForMessage(imapClient *client.Client, folderName
 
 	// Ищем письмо по Message-ID
 	// Message-ID может быть с угловыми скобками или без них
+	// В заголовке письма он хранится как <askemailsender123@host>
 	messageIDClean := strings.Trim(messageID, "<>")
+
+	// Формируем полный Message-ID с угловыми скобками для поиска
+	// IMAP SEARCH HEADER ищет точное совпадение в заголовке
+	messageIDForSearch := "<" + messageIDClean + ">"
+
+	// Логируем для отладки
+	if logger.Log != nil {
+		logger.Log.Debug("Поиск письма в папке",
+			zap.String("folder", folderName),
+			zap.String("messageIDOriginal", messageID),
+			zap.String("messageIDClean", messageIDClean),
+			zap.String("messageIDForSearch", messageIDForSearch))
+	}
+
+	// Пробуем поиск через SEARCH команду
+	// Если не работает (например, "SEARCH Backend error" от Yandex), используем ручную проверку
+	var ids []uint32
+	var searchErr error
+
+	// Вариант 1: Поиск по HEADER с угловыми скобками
 	criteria := imap.NewSearchCriteria()
-	criteria.Header.Add("Message-ID", messageIDClean)
+	criteria.Header.Add("Message-ID", messageIDForSearch)
+	ids, searchErr = imapClient.Search(criteria)
 
-	ids, err := imapClient.Search(criteria)
-	if err != nil {
-		return 0, err
-	}
+	// Если поиск не удался из-за ошибки сервера, переходим к ручной проверке
+	if searchErr != nil || len(ids) == 0 {
+		if searchErr != nil {
+			if logger.Log != nil {
+				logger.Log.Debug("SEARCH команда не работает, используем ручную проверку",
+					zap.String("folder", folderName),
+					zap.Error(searchErr))
+			}
+		}
 
-	if len(ids) == 0 {
-		return 0, fmt.Errorf("письмо не найдено")
-	}
-
-	// Получаем письмо для проверки на наличие ошибок
-	seqSet := new(imap.SeqSet)
-	seqSet.AddNum(ids...)
-
-	section := &imap.BodySectionName{}
-	items := []imap.FetchItem{imap.FetchEnvelope, section.FetchItem()}
-
-	messages := make(chan *imap.Message, 1)
-	done := make(chan error, 1)
-
-	go func() {
-		done <- imapClient.Fetch(seqSet, items, messages)
-	}()
-
-	select {
-	case err := <-done:
+		// Ручная проверка: получаем последние письма и проверяем их Message-ID
+		mailboxStatus, err := imapClient.Status(folderName, []imap.StatusItem{imap.StatusMessages})
 		if err != nil {
-			return 0, err
-		}
-	case msg := <-messages:
-		if msg == nil {
-			return 0, fmt.Errorf("письмо не получено")
+			return 0, fmt.Errorf("ошибка получения статуса папки: %w", err)
 		}
 
-		// Проверяем наличие ошибок в заголовках или теле письма
-		// Если есть ошибки отправки, возвращаем статус 3
-		// Пока что просто возвращаем 1 (найдено)
-		return 1, nil
+		if mailboxStatus.Messages == 0 {
+			return 0, fmt.Errorf("папка пуста")
+		}
+
+		// Получаем последние 100 писем (достаточно для недавно отправленных)
+		maxMessages := uint32(100)
+		if mailboxStatus.Messages < maxMessages {
+			maxMessages = mailboxStatus.Messages
+		}
+
+		seqSet := new(imap.SeqSet)
+		seqSet.AddRange(mailboxStatus.Messages-maxMessages+1, mailboxStatus.Messages)
+
+		// Получаем только Envelope (быстрее, чем полное тело)
+		items := []imap.FetchItem{imap.FetchEnvelope}
+
+		messages := make(chan *imap.Message, 10)
+		done := make(chan error, 1)
+
+		go func() {
+			done <- imapClient.Fetch(seqSet, items, messages)
+		}()
+
+		// Проверяем каждое письмо
+		for {
+			select {
+			case err := <-done:
+				if err != nil {
+					return 0, fmt.Errorf("ошибка получения писем: %w", err)
+				}
+				// Все письма проверены, не найдено
+				return 0, fmt.Errorf("письмо не найдено в папке '%s' по Message-ID '%s'", folderName, messageIDForSearch)
+			case msg := <-messages:
+				if msg == nil {
+					continue
+				}
+
+				// Проверяем Message-ID из Envelope
+				if msg.Envelope != nil && msg.Envelope.MessageId != "" {
+					envelopeMsgID := strings.Trim(msg.Envelope.MessageId, "<>")
+					if envelopeMsgID == messageIDClean {
+						if logger.Log != nil {
+							logger.Log.Debug("Письмо найдено через проверку Envelope",
+								zap.String("folder", folderName),
+								zap.String("messageID", messageIDClean))
+						}
+						return 1, nil
+					}
+				}
+			}
+		}
 	}
 
-	return 0, fmt.Errorf("письмо не найдено")
+	// SEARCH сработал, письмо найдено
+	if logger.Log != nil {
+		logger.Log.Debug("Письмо найдено через SEARCH",
+			zap.String("folder", folderName),
+			zap.String("messageID", messageIDForSearch),
+			zap.Int("foundCount", len(ids)))
+	}
+
+	// Письмо найдено через SEARCH, возвращаем успех
+	return 1, nil
 }

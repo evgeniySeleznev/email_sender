@@ -92,6 +92,9 @@ func (s *Service) SendEmail(ctx context.Context, msg *EmailMessage) error {
 
 	// Сохраняем информацию об отправленном письме для последующей проверки статуса
 	smtpCfg := &s.cfg.SMTP[smtpIndex]
+	// Message-ID должен совпадать с тем, что в заголовке письма
+	// В smtp.go он формируется как: <askemailsender%d@%s>
+	// Поэтому здесь тоже используем тот же формат (без угловых скобок, они добавятся при поиске)
 	messageID := fmt.Sprintf("askemailsender%d@%s", msg.TaskID, smtpCfg.Host)
 	sentInfo := &SentEmailInfo{
 		TaskID:    msg.TaskID,
