@@ -634,41 +634,74 @@ func (s *Service) shouldLoadStatuses() bool {
 	return false
 }
 
-// loadDeliveryStatuses загружает статусы доставки через POP3
+// loadDeliveryStatuses загружает статусы доставки через IMAP или POP3
 func (s *Service) loadDeliveryStatuses(ctx context.Context) {
-	// Обрабатываем каждый SMTP сервер с POP3
+	// Обрабатываем каждый SMTP сервер
 	for i, smtpCfg := range s.cfg.SMTP {
-		if smtpCfg.POPHost == "" {
-			continue // POP3 не настроен для этого SMTP
-		}
-
-		pop3Client := email.NewPOP3Client(&smtpCfg)
 		sourceEmail := smtpCfg.User
 
-		// Обрабатываем статусы доставки
-		logger.Log.Info("Начало проверки статусов доставки через POP3",
-			zap.Int("smtpIndex", i),
-			zap.String("popHost", smtpCfg.POPHost),
-			zap.String("sourceEmail", sourceEmail))
+		// Приоритет IMAP, если настроен, иначе используем POP3
+		if smtpCfg.IMAPHost != "" {
+			// Используем IMAP
+			imapClient := email.NewIMAPClient(&smtpCfg)
 
-		err := pop3Client.GetMessagesStatus(ctx, sourceEmail, func(taskID int64, status int, statusDesc string) {
-			logger.Log.Info("Обработка DSN статуса",
-				zap.Int64("taskID", taskID),
-				zap.Int("status", status),
-				zap.String("description", statusDesc))
-			// Сохраняем статус в очередь результатов
-			s.enqueueResponse(taskID, status, statusDesc)
-		})
+			logger.Log.Info("Начало проверки статусов доставки через IMAP",
+				zap.Int("smtpIndex", i),
+				zap.String("imapHost", smtpCfg.IMAPHost),
+				zap.String("sourceEmail", sourceEmail))
 
-		if err != nil {
-			logger.Log.Error("Ошибка получения статусов доставки",
+			err := imapClient.GetMessagesStatus(ctx, sourceEmail, func(taskID int64, status int, statusDesc string) {
+				logger.Log.Info("Обработка DSN статуса через IMAP",
+					zap.Int64("taskID", taskID),
+					zap.Int("status", status),
+					zap.String("description", statusDesc))
+				// Сохраняем статус в очередь результатов
+				s.enqueueResponse(taskID, status, statusDesc)
+			})
+
+			if err != nil {
+				logger.Log.Error("Ошибка получения статусов доставки через IMAP",
+					zap.Int("smtpIndex", i),
+					zap.String("imapHost", smtpCfg.IMAPHost),
+					zap.Error(err))
+			} else {
+				logger.Log.Info("Проверка статусов доставки через IMAP завершена успешно",
+					zap.Int("smtpIndex", i),
+					zap.String("imapHost", smtpCfg.IMAPHost))
+			}
+		} else if smtpCfg.POPHost != "" {
+			// Используем POP3 как fallback
+			pop3Client := email.NewPOP3Client(&smtpCfg)
+
+			logger.Log.Info("Начало проверки статусов доставки через POP3",
 				zap.Int("smtpIndex", i),
 				zap.String("popHost", smtpCfg.POPHost),
-				zap.Error(err))
+				zap.String("sourceEmail", sourceEmail))
+
+			err := pop3Client.GetMessagesStatus(ctx, sourceEmail, func(taskID int64, status int, statusDesc string) {
+				logger.Log.Info("Обработка DSN статуса через POP3",
+					zap.Int64("taskID", taskID),
+					zap.Int("status", status),
+					zap.String("description", statusDesc))
+				// Сохраняем статус в очередь результатов
+				s.enqueueResponse(taskID, status, statusDesc)
+			})
+
+			if err != nil {
+				logger.Log.Error("Ошибка получения статусов доставки через POP3",
+					zap.Int("smtpIndex", i),
+					zap.String("popHost", smtpCfg.POPHost),
+					zap.Error(err))
+			} else {
+				logger.Log.Info("Проверка статусов доставки через POP3 завершена успешно",
+					zap.Int("smtpIndex", i),
+					zap.String("popHost", smtpCfg.POPHost))
+			}
 		} else {
-			logger.Log.Info("Проверка статусов доставки завершена успешно",
+			// Ни IMAP, ни POP3 не настроены
+			logger.Log.Debug("IMAP и POP3 не настроены для SMTP сервера",
 				zap.Int("smtpIndex", i),
-				zap.String("popHost", smtpCfg.POPHost))
+				zap.String("host", smtpCfg.Host))
 		}
 	}
 }

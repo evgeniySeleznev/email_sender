@@ -6,6 +6,7 @@ import (
 	"encoding/base64"
 	"fmt"
 	"mime"
+	"net"
 	"net/smtp"
 	"path/filepath"
 	"strings"
@@ -144,7 +145,7 @@ func encodeHeader(text string) string {
 	if text == "" {
 		return text
 	}
-	
+
 	// Проверяем, есть ли не-ASCII символы
 	needsEncoding := false
 	for _, r := range text {
@@ -153,11 +154,11 @@ func encodeHeader(text string) string {
 			break
 		}
 	}
-	
+
 	if !needsEncoding {
 		return text
 	}
-	
+
 	// Используем Q-encoding для заголовков (RFC 2047)
 	return mime.QEncoding.Encode("UTF-8", text)
 }
@@ -261,26 +262,50 @@ func (c *SMTPClient) sendWithTLS(ctx context.Context, addr string, auth smtp.Aut
 	done := make(chan error, 1)
 
 	go func() {
-		// Подключаемся к SMTP серверу
-		client, err := smtp.Dial(addr)
-		if err != nil {
-			done <- fmt.Errorf("ошибка подключения к SMTP: %w", err)
-			return
-		}
-		defer client.Close()
+		var client *smtp.Client
+		var err error
 
-		// Проверяем поддержку STARTTLS
-		if ok, _ := client.Extension("STARTTLS"); ok {
-			if err := client.StartTLS(tlsConfig); err != nil {
-				done <- fmt.Errorf("ошибка STARTTLS: %w", err)
+		// Порт 465 использует SMTPS (SMTP over SSL) - прямое TLS соединение
+		// Порт 587 использует STARTTLS - сначала обычное соединение, потом переключение на TLS
+		if c.cfg.Port == 465 {
+			// Для порта 465 используем прямое TLS соединение
+			conn, err := tls.DialWithDialer(&net.Dialer{Timeout: 30 * time.Second}, "tcp", addr, tlsConfig)
+			if err != nil {
+				done <- fmt.Errorf("ошибка подключения к SMTP через TLS (порт 465): %w", err)
 				return
 			}
-		} else if c.cfg.EnableSSL {
-			// Если требуется SSL, но STARTTLS не поддерживается, используем прямое TLS соединение
-			// Это требует использования tls.Dial вместо smtp.Dial
-			done <- fmt.Errorf("сервер не поддерживает STARTTLS, но требуется SSL")
-			return
+			defer conn.Close()
+
+			// Создаем SMTP клиент поверх TLS соединения
+			client, err = smtp.NewClient(conn, c.cfg.Host)
+			if err != nil {
+				done <- fmt.Errorf("ошибка создания SMTP клиента: %w", err)
+				return
+			}
+		} else {
+			// Для других портов (587, 25 и т.д.) используем обычное соединение с STARTTLS
+			client, err = smtp.Dial(addr)
+			if err != nil {
+				done <- fmt.Errorf("ошибка подключения к SMTP: %w", err)
+				return
+			}
+
+			// Проверяем поддержку STARTTLS
+			if ok, _ := client.Extension("STARTTLS"); ok {
+				if err := client.StartTLS(tlsConfig); err != nil {
+					client.Close()
+					done <- fmt.Errorf("ошибка STARTTLS: %w", err)
+					return
+				}
+			} else if c.cfg.EnableSSL {
+				// Если требуется SSL, но STARTTLS не поддерживается
+				client.Close()
+				done <- fmt.Errorf("сервер не поддерживает STARTTLS, но требуется SSL")
+				return
+			}
 		}
+
+		defer client.Close()
 
 		// Аутентификация
 		if auth != nil {

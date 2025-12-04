@@ -37,6 +37,8 @@ type SMTPConfig struct {
 	SMTPMinSendEmailIntervalMsec int
 	POPHost                      string
 	POPPort                      int
+	IMAPHost                     string // IMAP сервер для получения DSN (альтернатива POP3)
+	IMAPPort                     int    // IMAP порт (обычно 993 для SSL)
 }
 
 // ModeConfig представляет режимы работы
@@ -161,6 +163,9 @@ func (c *Config) loadSMTPConfig() error {
 		popHost := sec.Key("POPHost").String()
 		popPort := sec.Key("POPPort").MustInt(110)
 
+		imapHost := sec.Key("IMAPHost").String()
+		imapPort := sec.Key("IMAPPort").MustInt(993) // По умолчанию 993 для SSL
+
 		c.SMTP = append(c.SMTP, SMTPConfig{
 			Host:                         host,
 			Port:                         port,
@@ -172,6 +177,8 @@ func (c *Config) loadSMTPConfig() error {
 			SMTPMinSendEmailIntervalMsec: minSendEmailIntervalMsec,
 			POPHost:                      popHost,
 			POPPort:                      popPort,
+			IMAPHost:                     imapHost,
+			IMAPPort:                     imapPort,
 		})
 	}
 
