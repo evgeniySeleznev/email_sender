@@ -191,8 +191,6 @@ func (c *SMTPClient) buildEmailMessage(msg *EmailMessage, recipientEmails []stri
 	encodedSubject := encodeHeader(subject)
 	headers += fmt.Sprintf("Subject: %s\r\n", encodedSubject)
 	headers += fmt.Sprintf("Message-ID: <%s@%s>\r\n", fmt.Sprintf("askemailsender%d", msg.TaskID), c.cfg.Host)
-	headers += fmt.Sprintf("X-Envelope-ID: askemailsender%d\r\n", msg.TaskID) // Для DSN
-	// Return-Path для корректной обработки DSN уведомлений
 	headers += fmt.Sprintf("Return-Path: <%s>\r\n", c.cfg.User)
 	headers += "MIME-Version: 1.0\r\n"
 

@@ -47,24 +47,19 @@ type Service struct {
 	nextDequeueAll time.Time
 	dequeueAllMu   sync.Mutex
 
-	// Получение статусов доставки
-	nextLoadStatuses time.Time
-	loadStatusesMu   sync.Mutex
 }
 
 // NewService создает новый сервис
-func NewService(cfg *settings.Config, dbConn *db.DBConnection, queueReader *db.QueueReader, emailService *email.Service) *Service {
+func NewService(cfg *settings.Config, dbConn *db.DBConnection, queueReader *db.QueueReader) *Service {
 	s := &Service{
 		cfg:          cfg,
 		dbConn:       dbConn,
 		queueReader:  queueReader,
-		emailService: emailService,
 
 		requestDir:       make(map[string]*db.QueueMessage),
 		responseQueue:    make(chan db.SaveEmailResponseParams, 10000), // Буферизованный канал
 		sendEmailMap:     make(map[string]time.Time),
-		nextDequeueAll:   time.Now(),                       // Сразу при запуске
-		nextLoadStatuses: time.Now().Add(15 * time.Second), // Первая проверка через 2 минуты после запуска
+		nextDequeueAll:   time.Now(), // Сразу при запуске
 	}
 
 	// Запускаем горутину для записи результатов в БД
@@ -187,12 +182,7 @@ func (s *Service) Run(ctx context.Context, wg *sync.WaitGroup) {
 
 		// 3. Записываем статусы отправки в базу (через канал responseQueue)
 
-		// 4. Получение статусов доставки сообщений
-		if s.shouldLoadStatuses() {
-			s.loadDeliveryStatuses(ctx)
-		}
-
-		// 5. Записываем подтверждения отправки в базу (через канал responseQueue)
+		// 4. Записываем подтверждения отправки в базу (через канал responseQueue)
 
 		// Перезапустить сервис если все отправлено и записано в базу
 		if s.needRestart.Load() && s.isRequestQueueEmpty() {
@@ -618,92 +608,16 @@ func (s *Service) writeResponseBatch(batch []db.SaveEmailResponseParams) {
 	}
 }
 
-// shouldLoadStatuses проверяет, нужно ли загрузить статусы доставки
-func (s *Service) shouldLoadStatuses() bool {
-	s.loadStatusesMu.Lock()
-	defer s.loadStatusesMu.Unlock()
-
-	if s.needRestart.Load() {
-		return false
+// GetStatusUpdateCallback возвращает callback для обновления статуса письма
+func (s *Service) GetStatusUpdateCallback() email.StatusUpdateCallback {
+	return func(taskID int64, status int, statusDesc string) {
+		s.enqueueResponse(taskID, status, statusDesc)
 	}
-
-	if time.Now().After(s.nextLoadStatuses) {
-		s.nextLoadStatuses = time.Now().Add(30 * time.Second) // Следующая проверка через 1 минуту
-		return true
-	}
-	return false
 }
 
-// loadDeliveryStatuses загружает статусы доставки через IMAP или POP3
-func (s *Service) loadDeliveryStatuses(ctx context.Context) {
-	// Обрабатываем каждый SMTP сервер
-	for i, smtpCfg := range s.cfg.SMTP {
-		sourceEmail := smtpCfg.User
-
-		// Приоритет IMAP, если настроен, иначе используем POP3
-		if smtpCfg.IMAPHost != "" {
-			// Используем IMAP
-			imapClient := email.NewIMAPClient(&smtpCfg)
-
-			logger.Log.Info("Начало проверки статусов доставки через IMAP",
-				zap.Int("smtpIndex", i),
-				zap.String("imapHost", smtpCfg.IMAPHost),
-				zap.String("sourceEmail", sourceEmail))
-
-			err := imapClient.GetMessagesStatus(ctx, sourceEmail, func(taskID int64, status int, statusDesc string) {
-				logger.Log.Info("Обработка DSN статуса через IMAP",
-					zap.Int64("taskID", taskID),
-					zap.Int("status", status),
-					zap.String("description", statusDesc))
-				// Сохраняем статус в очередь результатов
-				s.enqueueResponse(taskID, status, statusDesc)
-			})
-
-			if err != nil {
-				logger.Log.Error("Ошибка получения статусов доставки через IMAP",
-					zap.Int("smtpIndex", i),
-					zap.String("imapHost", smtpCfg.IMAPHost),
-					zap.Error(err))
-			} else {
-				logger.Log.Info("Проверка статусов доставки через IMAP завершена успешно",
-					zap.Int("smtpIndex", i),
-					zap.String("imapHost", smtpCfg.IMAPHost))
-			}
-		} else if smtpCfg.POPHost != "" {
-			// Используем POP3 как fallback
-			pop3Client := email.NewPOP3Client(&smtpCfg)
-
-			logger.Log.Info("Начало проверки статусов доставки через POP3",
-				zap.Int("smtpIndex", i),
-				zap.String("popHost", smtpCfg.POPHost),
-				zap.String("sourceEmail", sourceEmail))
-
-			err := pop3Client.GetMessagesStatus(ctx, sourceEmail, func(taskID int64, status int, statusDesc string) {
-				logger.Log.Info("Обработка DSN статуса через POP3",
-					zap.Int64("taskID", taskID),
-					zap.Int("status", status),
-					zap.String("description", statusDesc))
-				// Сохраняем статус в очередь результатов
-				s.enqueueResponse(taskID, status, statusDesc)
-			})
-
-			if err != nil {
-				logger.Log.Error("Ошибка получения статусов доставки через POP3",
-					zap.Int("smtpIndex", i),
-					zap.String("popHost", smtpCfg.POPHost),
-					zap.Error(err))
-			} else {
-				logger.Log.Info("Проверка статусов доставки через POP3 завершена успешно",
-					zap.Int("smtpIndex", i),
-					zap.String("popHost", smtpCfg.POPHost))
-			}
-		} else {
-			// Ни IMAP, ни POP3 не настроены
-			logger.Log.Debug("IMAP и POP3 не настроены для SMTP сервера",
-				zap.Int("smtpIndex", i),
-				zap.String("host", smtpCfg.Host))
-		}
-	}
+// SetEmailService устанавливает email сервис
+func (s *Service) SetEmailService(emailService *email.Service) {
+	s.emailService = emailService
 }
 
 // logStatistics логирует статистику при завершении

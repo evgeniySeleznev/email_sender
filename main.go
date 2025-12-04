@@ -34,8 +34,9 @@ func main() {
 	shutdownRequested := setupSignalHandling()
 
 	queueReader := initializeQueueReader(dbConn)
-	emailService := initializeEmailService(cfg, dbConn)
-	mainService := service.NewService(cfg, dbConn, queueReader, emailService)
+	mainService := service.NewService(cfg, dbConn, queueReader)
+	emailService := initializeEmailService(cfg, dbConn, mainService.GetStatusUpdateCallback())
+	mainService.SetEmailService(emailService)
 
 	var allHandlersWg sync.WaitGroup
 	startMainService(ctx, mainService, &allHandlersWg)
@@ -114,8 +115,8 @@ func initializeQueueReader(dbConn *db.DBConnection) *db.QueueReader {
 }
 
 // initializeEmailService создает email сервис
-func initializeEmailService(cfg *settings.Config, dbConn *db.DBConnection) *email.Service {
-	emailService, err := email.NewService(cfg, dbConn)
+func initializeEmailService(cfg *settings.Config, dbConn *db.DBConnection, statusCallback email.StatusUpdateCallback) *email.Service {
+	emailService, err := email.NewService(cfg, dbConn, statusCallback)
 	if err != nil {
 		logger.Log.Fatal("Ошибка создания email сервиса", zap.Error(err))
 	}

@@ -4,17 +4,14 @@ import (
 	"context"
 	"crypto/tls"
 	"fmt"
-	"io"
 	"strings"
 	"sync"
 	"time"
 
+	"email-service/settings"
+
 	"github.com/emersion/go-imap"
 	"github.com/emersion/go-imap/client"
-	"go.uber.org/zap"
-
-	"email-service/logger"
-	"email-service/settings"
 )
 
 // IMAPClient представляет IMAP клиент для получения статусов доставки
@@ -32,20 +29,12 @@ func NewIMAPClient(cfg *settings.SMTPConfig) *IMAPClient {
 	}
 }
 
-// GetMessagesStatus получает статусы доставки из IMAP почтового ящика
-func (c *IMAPClient) GetMessagesStatus(ctx context.Context, sourceEmail string, processDSN func(taskID int64, status int, statusDesc string)) error {
+// CheckEmailStatus проверяет статус письма по Message-ID в папках "исходящие" и "отправленные"
+// Возвращает status (0 - не найдено, 3 - ошибка, 4 - отправлено), описание и ошибку
+func (c *IMAPClient) CheckEmailStatus(ctx context.Context, messageID string) (int, string, error) {
 	if c.cfg.IMAPHost == "" {
-		return nil // IMAP не настроен
+		return 0, "", fmt.Errorf("IMAP не настроен")
 	}
-
-	c.mu.Lock()
-	defer c.mu.Unlock()
-
-	startTime := time.Now()
-
-	logger.Log.Info("Получение статусов доставки через IMAP",
-		zap.String("imapHost", c.cfg.IMAPHost),
-		zap.Int("imapPort", c.cfg.IMAPPort))
 
 	// Подключаемся к IMAP серверу
 	addr := fmt.Sprintf("%s:%d", c.cfg.IMAPHost, c.cfg.IMAPPort)
@@ -68,211 +57,104 @@ func (c *IMAPClient) GetMessagesStatus(ctx context.Context, sourceEmail string, 
 				InsecureSkipVerify: false,
 			}); err != nil {
 				imapClient.Logout()
-				return fmt.Errorf("ошибка STARTTLS: %w", err)
+				return 0, "", fmt.Errorf("ошибка STARTTLS: %w", err)
 			}
 		}
 	}
 
 	if err != nil {
-		return fmt.Errorf("ошибка подключения к IMAP: %w", err)
+		return 0, "", fmt.Errorf("ошибка подключения к IMAP: %w", err)
 	}
 	defer imapClient.Logout()
 
 	// Аутентификация
 	if err := imapClient.Login(c.cfg.User, c.cfg.Password); err != nil {
-		return fmt.Errorf("ошибка аутентификации IMAP: %w", err)
+		return 0, "", fmt.Errorf("ошибка аутентификации IMAP: %w", err)
 	}
 
-	// Выбираем папку INBOX
-	_, err = imapClient.Select("INBOX", false)
-	if err != nil {
-		return fmt.Errorf("ошибка выбора папки INBOX: %w", err)
-	}
+	// Список возможных названий папок для исходящих и отправленных
+	outboxFolders := []string{"Исходящие", "Outbox", "Sent", "Отправленные", "Sent Items"}
+	sentFolders := []string{"Отправленные", "Sent", "Sent Items", "Sent Messages"}
 
-	// Ищем непрочитанные сообщения (или все сообщения после lastStatusTime)
-	criteria := imap.NewSearchCriteria()
-	criteria.Since = c.lastStatusTime
-	// Также ищем по заголовку X-Envelope-ID для DSN
-	criteria.Header.Add("X-Envelope-ID", "")
-
-	ids, err := imapClient.Search(criteria)
-	if err != nil {
-		// Если поиск по заголовку не работает, ищем все сообщения после даты
-		criteria = imap.NewSearchCriteria()
-		criteria.Since = c.lastStatusTime
-		ids, err = imapClient.Search(criteria)
-		if err != nil {
-			return fmt.Errorf("ошибка поиска сообщений: %w", err)
+	// Проверяем папку "исходящие" (Outbox)
+	for _, folderName := range outboxFolders {
+		status, err := c.checkFolderForMessage(imapClient, folderName, messageID)
+		if err == nil && status > 0 {
+			if status == 3 {
+				// Найдено в исходящих с ошибкой
+				return 3, fmt.Sprintf("Письмо найдено в папке '%s' с ошибкой отправки", folderName), nil
+			}
+			// Найдено в исходящих без ошибки - еще не отправлено
+			return 0, "", nil
 		}
 	}
 
+	// Проверяем папку "отправленные" (Sent)
+	for _, folderName := range sentFolders {
+		status, err := c.checkFolderForMessage(imapClient, folderName, messageID)
+		if err == nil && status > 0 {
+			// Найдено в отправленных - успешно отправлено
+			return 4, fmt.Sprintf("Письмо найдено в папке '%s'", folderName), nil
+		}
+	}
+
+	// Не найдено ни в одной папке
+	return 0, "", nil
+}
+
+// checkFolderForMessage проверяет наличие письма в указанной папке по Message-ID
+func (c *IMAPClient) checkFolderForMessage(imapClient *client.Client, folderName, messageID string) (int, error) {
+	// Пробуем выбрать папку
+	_, err := imapClient.Select(folderName, false)
+	if err != nil {
+		// Папка не существует или недоступна
+		return 0, err
+	}
+
+	// Ищем письмо по Message-ID
+	// Message-ID может быть с угловыми скобками или без них
+	messageIDClean := strings.Trim(messageID, "<>")
+	criteria := imap.NewSearchCriteria()
+	criteria.Header.Add("Message-ID", messageIDClean)
+
+	ids, err := imapClient.Search(criteria)
+	if err != nil {
+		return 0, err
+	}
+
 	if len(ids) == 0 {
-		logger.Log.Info("Нет новых сообщений в IMAP ящике",
-			zap.String("imapHost", c.cfg.IMAPHost),
-			zap.Time("lastStatusTime", c.lastStatusTime))
-		c.lastStatusTime = startTime
-		return nil
+		return 0, fmt.Errorf("письмо не найдено")
 	}
 
-	logger.Log.Info("Найдено сообщений в IMAP ящике",
-		zap.String("imapHost", c.cfg.IMAPHost),
-		zap.Int("totalMessages", len(ids)),
-		zap.Time("lastStatusTime", c.lastStatusTime))
-
-	// Ограничение на количество обрабатываемых сообщений
-	maxMessages := 1000
-	if len(ids) > maxMessages {
-		ids = ids[:maxMessages]
-		logger.Log.Debug("Ограничение количества сообщений", zap.Int("max", maxMessages))
-	}
-
-	// Получаем сообщения
+	// Получаем письмо для проверки на наличие ошибок
 	seqSet := new(imap.SeqSet)
 	seqSet.AddNum(ids...)
 
 	section := &imap.BodySectionName{}
-	items := []imap.FetchItem{section.FetchItem(), imap.FetchEnvelope}
+	items := []imap.FetchItem{imap.FetchEnvelope, section.FetchItem()}
 
-	messages := make(chan *imap.Message, 10)
+	messages := make(chan *imap.Message, 1)
 	done := make(chan error, 1)
 
 	go func() {
 		done <- imapClient.Fetch(seqSet, items, messages)
 	}()
 
-	processed := 0
-
-	for {
-		select {
-		case <-ctx.Done():
-			logger.Log.Info("Прерывание получения статусов из-за отмены контекста")
-			return ctx.Err()
-		case err := <-done:
-			if err != nil {
-				return fmt.Errorf("ошибка получения сообщений: %w", err)
-			}
-			// Все сообщения получены
-			goto done
-		case msg := <-messages:
-			if msg == nil {
-				continue
-			}
-
-			// Проверяем дату сообщения
-			if msg.Envelope != nil && msg.Envelope.Date.Before(c.lastStatusTime) {
-				logger.Log.Debug("Пропускаем сообщение, дата раньше lastStatusTime",
-					zap.Time("messageDate", msg.Envelope.Date),
-					zap.Time("lastStatusTime", c.lastStatusTime))
-				continue
-			}
-
-			// Получаем тело сообщения
-			if msg.Body == nil {
-				logger.Log.Debug("Сообщение не содержит тела")
-				continue
-			}
-
-			// Читаем тело сообщения
-			bodyData, err := io.ReadAll(msg.Body[section])
-			if err != nil {
-				logger.Log.Debug("Ошибка чтения тела сообщения", zap.Error(err))
-				continue
-			}
-
-			// Парсим MIME сообщение
-			mimeMsg, err := ParseMIMEMessage(bodyData)
-			if err != nil {
-				logger.Log.Debug("Ошибка парсинга MIME сообщения", zap.Error(err))
-				continue
-			}
-
-			// Логируем информацию о сообщении для отладки
-			var msgDate time.Time
-			if mimeMsg.Date != nil {
-				msgDate = *mimeMsg.Date
-			} else if msg.Envelope != nil {
-				msgDate = msg.Envelope.Date
-			}
-			logger.Log.Debug("Обработка сообщения из IMAP",
-				zap.Uint32("seqNum", msg.SeqNum),
-				zap.Int("partsCount", len(mimeMsg.Parts)),
-				zap.Int("bodySize", len(mimeMsg.Body)),
-				zap.Time("date", msgDate))
-
-			// Обрабатываем DSN
-			taskID, status, statusDesc := ProcessDeliveryStatusNotification(sourceEmail, mimeMsg)
-			if taskID > 0 && status > 0 {
-				logger.Log.Info("Получен статус доставки через IMAP",
-					zap.Int64("taskID", taskID),
-					zap.Int("status", status),
-					zap.String("description", statusDesc))
-
-				// Вызываем callback для обработки статуса
-				processDSN(taskID, status, statusDesc)
-
-				processed++
-
-				// Помечаем сообщение как прочитанное (не удаляем, как в POP3)
-				seqSet := new(imap.SeqSet)
-				seqSet.AddNum(msg.SeqNum)
-				item := imap.FormatFlagsOp(imap.AddFlags, true)
-				flags := []interface{}{imap.SeenFlag}
-				if err := imapClient.Store(seqSet, item, flags, nil); err != nil {
-					logger.Log.Warn("Ошибка пометки сообщения как прочитанного", zap.Uint32("seqNum", msg.SeqNum), zap.Error(err))
-				}
-			} else {
-				// Логируем подробную информацию о сообщении для диагностики
-				bodyPreview := ""
-				if len(mimeMsg.Body) > 0 {
-					bodyStr := string(mimeMsg.Body)
-					if len(bodyStr) > 500 {
-						bodyPreview = bodyStr[:500] + "..."
-					} else {
-						bodyPreview = bodyStr
-					}
-				}
-
-				// Проверяем, содержит ли сообщение ключевые слова DSN
-				isDSNCandidate := false
-				if len(mimeMsg.Body) > 0 {
-					bodyStr := string(mimeMsg.Body)
-					isDSNCandidate = strings.Contains(bodyStr, "delivery-status") ||
-						strings.Contains(bodyStr, "Original-Envelope-Id") ||
-						strings.Contains(bodyStr, "X-Envelope-ID") ||
-						strings.Contains(bodyStr, "askemailsender")
-				}
-
-				for _, part := range mimeMsg.Parts {
-					if strings.Contains(part.ContentType, "delivery-status") {
-						isDSNCandidate = true
-						break
-					}
-				}
-
-				if isDSNCandidate {
-					logger.Log.Info("Найдено потенциальное DSN сообщение через IMAP, но оно не было обработано",
-						zap.Uint32("seqNum", msg.SeqNum),
-						zap.Int("partsCount", len(mimeMsg.Parts)),
-						zap.String("bodyPreview", bodyPreview),
-						zap.Int64("taskID", taskID),
-						zap.Int("status", status))
-				} else {
-					logger.Log.Debug("Сообщение не является DSN",
-						zap.Uint32("seqNum", msg.SeqNum),
-						zap.Int("partsCount", len(mimeMsg.Parts)))
-				}
-			}
+	select {
+	case err := <-done:
+		if err != nil {
+			return 0, err
 		}
+	case msg := <-messages:
+		if msg == nil {
+			return 0, fmt.Errorf("письмо не получено")
+		}
+
+		// Проверяем наличие ошибок в заголовках или теле письма
+		// Если есть ошибки отправки, возвращаем статус 3
+		// Пока что просто возвращаем 1 (найдено)
+		return 1, nil
 	}
 
-done:
-	c.lastStatusTime = startTime
-
-	logger.Log.Info("Завершена проверка статусов доставки через IMAP",
-		zap.String("imapHost", c.cfg.IMAPHost),
-		zap.Int("processedDSN", processed),
-		zap.Int("totalMessages", len(ids)),
-		zap.Duration("duration", time.Since(startTime)))
-
-	return nil
+	return 0, fmt.Errorf("письмо не найдено")
 }

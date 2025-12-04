@@ -15,18 +15,21 @@ import (
 
 // Service представляет email сервис
 type Service struct {
-	cfg                *settings.Config
-	dbConn             *db.DBConnection
-	smtpClients        []*SMTPClient
+	cfg                 *settings.Config
+	dbConn              *db.DBConnection
+	smtpClients         []*SMTPClient
 	attachmentProcessor *AttachmentProcessor
-	testEmail          string
-	testEmailCacheTime time.Time
-	testEmailMu        sync.RWMutex
-	testEmailCacheTTL  time.Duration
+	testEmail           string
+	testEmailCacheTime  time.Time
+	testEmailMu         sync.RWMutex
+	testEmailCacheTTL   time.Duration
+
+	// Проверка статуса отправленных писем
+	statusChecker *StatusChecker
 }
 
 // NewService создает новый email сервис
-func NewService(cfg *settings.Config, dbConn *db.DBConnection) (*Service, error) {
+func NewService(cfg *settings.Config, dbConn *db.DBConnection, statusCallback StatusUpdateCallback) (*Service, error) {
 	// Создаем SMTP клиенты для каждого SMTP сервера
 	smtpClients := make([]*SMTPClient, 0, len(cfg.SMTP))
 	for i := range cfg.SMTP {
@@ -34,13 +37,20 @@ func NewService(cfg *settings.Config, dbConn *db.DBConnection) (*Service, error)
 		smtpClients = append(smtpClients, client)
 	}
 
-	return &Service{
-		cfg:                cfg,
-		dbConn:             dbConn,
-		smtpClients:        smtpClients,
+	service := &Service{
+		cfg:                 cfg,
+		dbConn:              dbConn,
+		smtpClients:         smtpClients,
 		attachmentProcessor: NewAttachmentProcessor(dbConn),
-		testEmailCacheTTL:  5 * time.Minute, // Кеш тестового email на 5 минут
-	}, nil
+		testEmailCacheTTL:   5 * time.Minute, // Кеш тестового email на 5 минут
+		statusChecker:       NewStatusChecker(cfg, statusCallback),
+	}
+
+	// Запускаем горутину для проверки статусов отправленных писем
+	// Контекст будет передан при вызове Close или через отдельный механизм
+	service.statusChecker.Start(context.Background())
+
+	return service, nil
 }
 
 // Close закрывает сервис
@@ -79,6 +89,19 @@ func (s *Service) SendEmail(ctx context.Context, msg *EmailMessage) error {
 	if err := smtpClient.SendEmail(ctx, msg, testEmail, s.cfg.Mode.IsBodyHTML, s.cfg.Mode.SendHiddenCopyToSelf); err != nil {
 		return fmt.Errorf("ошибка отправки через SMTP: %w", err)
 	}
+
+	// Сохраняем информацию об отправленном письме для последующей проверки статуса
+	smtpCfg := &s.cfg.SMTP[smtpIndex]
+	messageID := fmt.Sprintf("askemailsender%d@%s", msg.TaskID, smtpCfg.Host)
+	sentInfo := &SentEmailInfo{
+		TaskID:    msg.TaskID,
+		SmtpID:    msg.SmtpID,
+		MessageID: messageID,
+		SendTime:  time.Now(),
+	}
+
+	// Планируем проверку статуса через 5 минут
+	s.statusChecker.ScheduleCheck(sentInfo)
 
 	return nil
 }
@@ -133,4 +156,3 @@ type AttachmentData struct {
 	FileName string
 	Data     []byte
 }
-

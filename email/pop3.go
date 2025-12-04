@@ -11,9 +11,6 @@ import (
 	"sync"
 	"time"
 
-	"go.uber.org/zap"
-
-	"email-service/logger"
 	"email-service/settings"
 )
 
@@ -32,20 +29,14 @@ func NewPOP3Client(cfg *settings.SMTPConfig) *POP3Client {
 	}
 }
 
-// GetMessagesStatus получает статусы доставки из POP3 почтового ящика
-func (c *POP3Client) GetMessagesStatus(ctx context.Context, sourceEmail string, processDSN func(taskID int64, status int, statusDesc string)) error {
+
+// CheckEmailStatus проверяет статус письма по Message-ID в POP3 почтовом ящике
+// POP3 не поддерживает папки, поэтому проверяем все сообщения
+// Возвращает status (0 - не найдено, 3 - ошибка, 4 - отправлено), описание и ошибку
+func (c *POP3Client) CheckEmailStatus(ctx context.Context, messageID string) (int, string, error) {
 	if c.cfg.POPHost == "" {
-		return nil // POP3 не настроен
+		return 0, "", fmt.Errorf("POP3 не настроен")
 	}
-
-	c.mu.Lock()
-	defer c.mu.Unlock()
-
-	startTime := time.Now()
-
-	logger.Log.Info("Получение статусов доставки",
-		zap.String("popHost", c.cfg.POPHost),
-		zap.Int("popPort", c.cfg.POPPort))
 
 	// Создаем POP3 клиент
 	client := &pop3Client{
@@ -57,148 +48,69 @@ func (c *POP3Client) GetMessagesStatus(ctx context.Context, sourceEmail string, 
 
 	// Подключаемся
 	if err := client.connect(ctx); err != nil {
-		return fmt.Errorf("ошибка подключения к POP3: %w", err)
+		return 0, "", fmt.Errorf("ошибка подключения к POP3: %w", err)
 	}
 	defer client.quit()
 
 	// Аутентификация
 	if err := client.auth(); err != nil {
-		return fmt.Errorf("ошибка аутентификации POP3: %w", err)
+		return 0, "", fmt.Errorf("ошибка аутентификации POP3: %w", err)
 	}
 
 	// Получаем количество сообщений
 	total, err := client.stat()
 	if err != nil {
-		return fmt.Errorf("ошибка получения статуса POP3: %w", err)
+		return 0, "", fmt.Errorf("ошибка получения статуса POP3: %w", err)
 	}
 
-	logger.Log.Info("Количество сообщений в POP3 ящике",
-		zap.String("popHost", c.cfg.POPHost),
-		zap.Int("totalMessages", total),
-		zap.Time("lastStatusTime", c.lastStatusTime))
-
-	processed := 0
-
-	// Обрабатываем сообщения с конца (новые сначала)
+	// Ищем письмо по Message-ID во всех сообщениях
 	for i := total; i > 0; i-- {
-		// Проверяем контекст
 		select {
 		case <-ctx.Done():
-			logger.Log.Info("Прерывание получения статусов из-за отмены контекста")
-			goto done
+			return 0, "", ctx.Err()
 		default:
-		}
-
-		// Ограничение на количество обрабатываемых сообщений
-		if total-i > 1000 {
-			logger.Log.Debug("Достигнут лимит обработки сообщений (1000)")
-			break
 		}
 
 		// Получаем сообщение
 		messageData, err := client.retr(i)
 		if err != nil {
-			logger.Log.Debug("Ошибка получения сообщения", zap.Int("index", i), zap.Error(err))
 			continue
 		}
 
-		// Парсим MIME сообщение
-		msg, err := ParseMIMEMessage(messageData)
-		if err != nil {
-			logger.Log.Debug("Ошибка парсинга MIME сообщения", zap.Int("index", i), zap.Error(err))
-			continue
-		}
-
-		// Проверяем дату сообщения
-		if msg.Date != nil && msg.Date.Before(c.lastStatusTime) {
-			logger.Log.Debug("Завершение чтения статусов. Дата сообщения раньше последней обработки",
-				zap.Time("messageDate", *msg.Date),
-				zap.Time("lastStatusTime", c.lastStatusTime))
-			break
-		}
-
-		// Логируем информацию о сообщении для отладки
-		var msgDate time.Time
-		if msg.Date != nil {
-			msgDate = *msg.Date
-		}
-		logger.Log.Debug("Обработка сообщения из POP3",
-			zap.Int("index", i),
-			zap.Int("partsCount", len(msg.Parts)),
-			zap.Int("bodySize", len(msg.Body)),
-			zap.Time("date", msgDate))
-
-		// Обрабатываем DSN
-		taskID, status, statusDesc := ProcessDeliveryStatusNotification(sourceEmail, msg)
-		if taskID > 0 && status > 0 {
-			logger.Log.Info("Получен статус доставки",
-				zap.Int64("taskID", taskID),
-				zap.Int("status", status),
-				zap.String("description", statusDesc))
-
-			// Вызываем callback для обработки статуса
-			processDSN(taskID, status, statusDesc)
-
-			processed++
-
-			// Удаляем обработанное сообщение
-			if err := client.deleteMsgId(i); err != nil {
-				logger.Log.Warn("Ошибка удаления сообщения", zap.Int("index", i), zap.Error(err))
-			}
-		} else {
-			// Логируем подробную информацию о сообщении для диагностики
-			bodyPreview := ""
-			if len(msg.Body) > 0 {
-				bodyStr := string(msg.Body)
-				if len(bodyStr) > 500 {
-					bodyPreview = bodyStr[:500] + "..."
-				} else {
-					bodyPreview = bodyStr
+		// Ищем Message-ID в заголовках
+		messageStr := string(messageData)
+		if strings.Contains(messageStr, "Message-ID:") {
+			// Извлекаем Message-ID из заголовков
+			lines := strings.Split(messageStr, "\n")
+			for _, line := range lines {
+				line = strings.TrimSpace(line)
+				if strings.HasPrefix(strings.ToLower(line), "message-id:") {
+					parts := strings.SplitN(line, ":", 2)
+					if len(parts) == 2 {
+						foundMessageID := strings.TrimSpace(parts[1])
+						// Убираем угловые скобки если есть
+						foundMessageID = strings.Trim(foundMessageID, "<>")
+						messageIDClean := strings.Trim(messageID, "<>")
+						
+						if strings.Contains(foundMessageID, messageIDClean) || strings.Contains(messageIDClean, foundMessageID) {
+							// Найдено письмо
+							// Проверяем наличие ошибок в теле сообщения
+							bodyStr := strings.ToLower(messageStr)
+							if strings.Contains(bodyStr, "error") || strings.Contains(bodyStr, "ошибка") ||
+								strings.Contains(bodyStr, "failed") || strings.Contains(bodyStr, "не удалось") {
+								return 3, "Письмо найдено с ошибкой отправки", nil
+							}
+							// Письмо найдено без ошибок - считаем отправленным
+							return 4, "Письмо найдено в почтовом ящике", nil
+						}
+					}
 				}
-			}
-
-			// Проверяем, содержит ли сообщение ключевые слова DSN
-			isDSNCandidate := false
-			if len(msg.Body) > 0 {
-				bodyStr := string(msg.Body)
-				isDSNCandidate = strings.Contains(bodyStr, "delivery-status") ||
-					strings.Contains(bodyStr, "Original-Envelope-Id") ||
-					strings.Contains(bodyStr, "X-Envelope-ID") ||
-					strings.Contains(bodyStr, "askemailsender")
-			}
-
-			for _, part := range msg.Parts {
-				if strings.Contains(part.ContentType, "delivery-status") {
-					isDSNCandidate = true
-					break
-				}
-			}
-
-			if isDSNCandidate {
-				logger.Log.Info("Найдено потенциальное DSN сообщение, но оно не было обработано",
-					zap.Int("index", i),
-					zap.Int("partsCount", len(msg.Parts)),
-					zap.String("bodyPreview", bodyPreview),
-					zap.Int64("taskID", taskID),
-					zap.Int("status", status))
-			} else {
-				logger.Log.Debug("Сообщение не является DSN",
-					zap.Int("index", i),
-					zap.Int("partsCount", len(msg.Parts)))
 			}
 		}
 	}
 
-done:
-	c.lastStatusTime = startTime
-
-	logger.Log.Info("Завершена проверка статусов доставки",
-		zap.String("popHost", c.cfg.POPHost),
-		zap.Int("processedDSN", processed),
-		zap.Int("totalMessages", total),
-		zap.Duration("duration", time.Since(startTime)))
-
-	return nil
+	// Не найдено
+	return 0, "", nil
 }
 
 // pop3Client представляет простой POP3 клиент
