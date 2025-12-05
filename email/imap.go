@@ -35,10 +35,16 @@ func NewIMAPClient(cfg *settings.SMTPConfig) *IMAPClient {
 
 // CheckEmailStatus проверяет наличие bounce messages по Message-ID во всех папках входящих
 // Возвращает status (3 - bounce найден/ошибка, 4 - bounce не найден/доставлено), описание и ошибку
+// Общий таймаут операции: 35 секунд
 func (c *IMAPClient) CheckEmailStatus(ctx context.Context, messageID string) (int, string, error) {
 	if c.cfg.IMAPHost == "" {
 		return 4, "IMAP не настроен, считаем письмо доставленным", nil
 	}
+
+	// Устанавливаем общий таймаут для всей операции: 35 секунд
+	// Это достаточно для проверки нескольких папок, но предотвращает зависание
+	timeoutCtx, cancel := context.WithTimeout(ctx, 35*time.Second)
+	defer cancel()
 
 	// Подключаемся к IMAP серверу
 	addr := fmt.Sprintf("%s:%d", c.cfg.IMAPHost, c.cfg.IMAPPort)
@@ -77,13 +83,44 @@ func (c *IMAPClient) CheckEmailStatus(ctx context.Context, messageID string) (in
 	}
 
 	// Проверяем bounce messages во всех папках входящих (включая INBOX, Spam, Trash и другие)
-	inboxFolders, err := c.listInboxFolders(imapClient)
+	inboxFolders, err := c.listInboxFolders(timeoutCtx, imapClient)
+	// Проверяем, является ли ошибка таймаутом
+	if err != nil && (err == context.DeadlineExceeded || err == context.Canceled) {
+		if logger.Log != nil {
+			logger.Log.Warn("Таймаут получения списка папок IMAP",
+				zap.String("messageID", messageID),
+				zap.Error(err))
+		}
+		return 4, "Таймаут проверки статуса, считаем письмо доставленным", err
+	}
 	if err == nil {
 		// Добавляем INBOX в начало списка, так как bounce messages обычно приходят туда
 		inboxFolders = append([]string{"INBOX"}, inboxFolders...)
 
 		for _, folderName := range inboxFolders {
-			bounceStatus, bounceDesc, err := c.checkBounceMessages(imapClient, folderName, messageID)
+			// Проверяем, не истек ли общий таймаут
+			select {
+			case <-timeoutCtx.Done():
+				if logger.Log != nil {
+					logger.Log.Warn("Таймаут проверки статуса письма",
+						zap.String("messageID", messageID),
+						zap.String("reason", "превышен общий таймаут 35 секунд"))
+				}
+				return 4, "Таймаут проверки статуса, считаем письмо доставленным", timeoutCtx.Err()
+			default:
+			}
+
+			bounceStatus, bounceDesc, err := c.checkBounceMessages(timeoutCtx, imapClient, folderName, messageID)
+			// Проверяем, является ли ошибка таймаутом
+			if err != nil && (err == context.DeadlineExceeded || err == context.Canceled) {
+				if logger.Log != nil {
+					logger.Log.Warn("Таймаут проверки папки IMAP",
+						zap.String("messageID", messageID),
+						zap.String("folder", folderName),
+						zap.Error(err))
+				}
+				return 4, "Таймаут проверки статуса, считаем письмо доставленным", err
+			}
 			if err == nil && bounceStatus == 3 {
 				// Найдено bounce message - письмо не доставлено
 				if logger.Log != nil {
@@ -96,8 +133,17 @@ func (c *IMAPClient) CheckEmailStatus(ctx context.Context, messageID string) (in
 			}
 		}
 	} else {
-		// Если не удалось получить список папок, проверяем хотя бы INBOX
-		bounceStatus, bounceDesc, err := c.checkBounceMessages(imapClient, "INBOX", messageID)
+		// Если не удалось получить список папок (не таймаут), проверяем хотя бы INBOX
+		bounceStatus, bounceDesc, err := c.checkBounceMessages(timeoutCtx, imapClient, "INBOX", messageID)
+		// Проверяем, является ли ошибка таймаутом
+		if err != nil && (err == context.DeadlineExceeded || err == context.Canceled) {
+			if logger.Log != nil {
+				logger.Log.Warn("Таймаут проверки INBOX IMAP",
+					zap.String("messageID", messageID),
+					zap.Error(err))
+			}
+			return 4, "Таймаут проверки статуса, считаем письмо доставленным", err
+		}
 		if err == nil && bounceStatus == 3 {
 			if logger.Log != nil {
 				logger.Log.Info("Найден bounce message в INBOX",
@@ -118,7 +164,8 @@ func (c *IMAPClient) CheckEmailStatus(ctx context.Context, messageID string) (in
 
 // listInboxFolders получает список всех папок входящих (INBOX|*, Spam, Trash и другие корневые папки входящих)
 // INBOX добавляется отдельно в CheckEmailStatus, так как bounce messages обычно приходят туда
-func (c *IMAPClient) listInboxFolders(imapClient *client.Client) ([]string, error) {
+// Таймаут: 15 секунд
+func (c *IMAPClient) listInboxFolders(ctx context.Context, imapClient *client.Client) ([]string, error) {
 	mailboxes := make(chan *imap.MailboxInfo, 10)
 	done := make(chan error, 1)
 
@@ -126,9 +173,19 @@ func (c *IMAPClient) listInboxFolders(imapClient *client.Client) ([]string, erro
 		done <- imapClient.List("", "*", mailboxes)
 	}()
 
+	// Таймаут для получения списка папок: 15 секунд
+	timeout := time.After(15 * time.Second)
+
 	var folders []string
 	for {
 		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case <-timeout:
+			if logger.Log != nil {
+				logger.Log.Warn("Таймаут получения списка папок IMAP", zap.Duration("timeout", 15*time.Second))
+			}
+			return folders, nil // Возвращаем то, что успели получить
 		case err := <-done:
 			if err != nil {
 				return nil, err
@@ -159,7 +216,8 @@ func (c *IMAPClient) listInboxFolders(imapClient *client.Client) ([]string, erro
 
 // checkBounceMessages проверяет наличие bounce messages в указанной папке
 // Ищет письма о недоставке, которые ссылаются на указанный Message-ID
-func (c *IMAPClient) checkBounceMessages(imapClient *client.Client, folderName, messageID string) (int, string, error) {
+// Таймаут: 15 секунд на папку
+func (c *IMAPClient) checkBounceMessages(ctx context.Context, imapClient *client.Client, folderName, messageID string) (int, string, error) {
 	// Пробуем выбрать папку
 	_, err := imapClient.Select(folderName, false)
 	if err != nil {
@@ -201,8 +259,21 @@ func (c *IMAPClient) checkBounceMessages(imapClient *client.Client, folderName, 
 		done <- imapClient.Fetch(seqSet, items, messages)
 	}()
 
+	// Таймаут для проверки папки: 15 секунд
+	timeout := time.After(15 * time.Second)
+
 	for {
 		select {
+		case <-ctx.Done():
+			return 0, "", ctx.Err()
+		case <-timeout:
+			if logger.Log != nil {
+				logger.Log.Debug("Таймаут проверки папки IMAP",
+					zap.String("folder", folderName),
+					zap.Duration("timeout", 15*time.Second))
+			}
+			// Таймаут - считаем, что bounce messages не найдено в этой папке
+			return 0, "", nil
 		case err := <-done:
 			if err != nil {
 				return 0, "", err
@@ -218,7 +289,7 @@ func (c *IMAPClient) checkBounceMessages(imapClient *client.Client, folderName, 
 			// Проверяем, является ли это bounce message
 			if c.isBounceMessage(msg, messageIDClean) {
 				// Получаем полное тело письма для извлечения деталей ошибки и проверки Message-ID
-				errorDesc, found := c.extractBounceError(msg, imapClient, folderName, messageIDClean)
+				errorDesc, found := c.extractBounceError(ctx, msg, imapClient, folderName, messageIDClean)
 				if found {
 					return 3, errorDesc, nil
 				}
@@ -301,7 +372,8 @@ func (c *IMAPClient) isBounceMessage(msg *imap.Message, messageIDClean string) b
 
 // extractBounceError извлекает описание ошибки из bounce message и проверяет наличие Message-ID в теле
 // Возвращает описание ошибки и флаг, указывающий, найден ли Message-ID в теле письма
-func (c *IMAPClient) extractBounceError(msg *imap.Message, imapClient *client.Client, folderName, messageIDClean string) (string, bool) {
+// Таймаут: 8 секунд
+func (c *IMAPClient) extractBounceError(ctx context.Context, msg *imap.Message, imapClient *client.Client, folderName, messageIDClean string) (string, bool) {
 	if msg.Uid == 0 {
 		return "", false
 	}
@@ -320,7 +392,19 @@ func (c *IMAPClient) extractBounceError(msg *imap.Message, imapClient *client.Cl
 		done <- imapClient.UidFetch(seqSet, items, messages)
 	}()
 
+	// Таймаут для получения тела письма: 8 секунд
+	timeout := time.After(8 * time.Second)
+
 	select {
+	case <-ctx.Done():
+		return "", false
+	case <-timeout:
+		if logger.Log != nil {
+			logger.Log.Debug("Таймаут получения тела письма IMAP",
+				zap.String("folder", folderName),
+				zap.Duration("timeout", 8*time.Second))
+		}
+		return "", false
 	case err := <-done:
 		if err != nil {
 			return "", false

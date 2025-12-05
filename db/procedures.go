@@ -190,7 +190,6 @@ func (d *DBConnection) GetTestEmail() (string, error) {
 
 	return "evgen.seleznev@gmail.com", nil
 
-	// отключено на время тестирования
 	// queryCtx, queryCancel := context.WithTimeout(context.Background(), QueryTimeout)
 	// defer queryCancel()
 

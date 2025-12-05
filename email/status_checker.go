@@ -21,7 +21,9 @@ type SentEmailInfo struct {
 }
 
 // StatusUpdateCallback функция для обновления статуса письма
-type StatusUpdateCallback func(taskID int64, status int, statusDesc string)
+// statusDesc - описание статуса для логирования
+// errorText - текст ошибки для записи в error_text (может быть пустым)
+type StatusUpdateCallback func(taskID int64, status int, statusDesc string, errorText string)
 
 // StatusChecker отвечает за проверку статуса отправленных писем через IMAP/POP3
 type StatusChecker struct {
@@ -114,7 +116,7 @@ func (sc *StatusChecker) checkEmailStatus(ctx context.Context, sentInfo *SentEma
 				zap.Int("smtpID", sentInfo.SmtpID),
 				zap.Int("smtpCount", len(sc.cfg.SMTP)))
 		}
-		sc.updateEmailStatus(sentInfo.TaskID, 3, "Некорректный SmtpID")
+		sc.updateEmailStatus(sentInfo.TaskID, 3, "Некорректный SmtpID", "Некорректный SmtpID")
 		return
 	}
 	smtpCfg := &sc.cfg.SMTP[sentInfo.SmtpID]
@@ -126,20 +128,35 @@ func (sc *StatusChecker) checkEmailStatus(ctx context.Context, sentInfo *SentEma
 				zap.Int("smtpID", sentInfo.SmtpID))
 		}
 		// Если IMAP не настроен, считаем письмо успешно отправленным (статус 4)
-		sc.updateEmailStatus(sentInfo.TaskID, 4, "IMAP не настроен, статус не проверяется")
+		sc.updateEmailStatus(sentInfo.TaskID, 4, "IMAP не настроен, статус не проверяется", "")
 		return
 	}
 
 	imapClient := NewIMAPClient(smtpCfg)
 	status, statusDesc, err := imapClient.CheckEmailStatus(ctx, sentInfo.MessageID)
 	if err != nil {
+		// Проверяем, является ли ошибка таймаутом
+		if err == context.DeadlineExceeded || err == context.Canceled {
+			// При таймауте оставляем статус 2 (отправлено), но записываем сообщение в error_text
+			timeoutMsg := fmt.Sprintf("Не уложились в таймаут проверки статуса через IMAP сервер (35 секунд): %v", err)
+			if logger.Log != nil {
+				logger.Log.Warn("Таймаут проверки статуса через IMAP",
+					zap.Int64("taskID", sentInfo.TaskID),
+					zap.String("messageID", sentInfo.MessageID),
+					zap.Error(err))
+			}
+			sc.updateEmailStatus(sentInfo.TaskID, 2, "Проверка статуса не завершена из-за таймаута", timeoutMsg)
+			return
+		}
+
+		// Для других ошибок устанавливаем статус 3 (ошибка)
 		if logger.Log != nil {
 			logger.Log.Error("Ошибка проверки статуса через IMAP",
 				zap.Int64("taskID", sentInfo.TaskID),
 				zap.String("messageID", sentInfo.MessageID),
 				zap.Error(err))
 		}
-		sc.updateEmailStatus(sentInfo.TaskID, 3, fmt.Sprintf("Ошибка проверки статуса через IMAP: %v", err))
+		sc.updateEmailStatus(sentInfo.TaskID, 3, fmt.Sprintf("Ошибка проверки статуса через IMAP: %v", err), fmt.Sprintf("Ошибка проверки статуса через IMAP: %v", err))
 		return
 	}
 
@@ -149,12 +166,18 @@ func (sc *StatusChecker) checkEmailStatus(ctx context.Context, sentInfo *SentEma
 			zap.Int("status", status),
 			zap.String("statusDesc", statusDesc))
 	}
-	sc.updateEmailStatus(sentInfo.TaskID, status, statusDesc)
+
+	// Для успешных проверок errorText пустой (заполняется только при статусе 3)
+	errorText := ""
+	if status == 3 {
+		errorText = statusDesc
+	}
+	sc.updateEmailStatus(sentInfo.TaskID, status, statusDesc, errorText)
 }
 
 // updateEmailStatus обновляет статус письма в БД через callback
-func (sc *StatusChecker) updateEmailStatus(taskID int64, status int, statusDesc string) {
+func (sc *StatusChecker) updateEmailStatus(taskID int64, status int, statusDesc string, errorText string) {
 	if sc.statusUpdateCallback != nil {
-		sc.statusUpdateCallback(taskID, status, statusDesc)
+		sc.statusUpdateCallback(taskID, status, statusDesc, errorText)
 	}
 }

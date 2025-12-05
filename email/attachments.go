@@ -150,14 +150,38 @@ func (p *AttachmentProcessor) processCrystalReport(ctx context.Context, attach *
 		return nil, fmt.Errorf("пустой отчет")
 	}
 
+	// Проверяем, что данные являются валидным PDF файлом (проверка магических байтов)
+	if len(data) < 4 || string(data[0:4]) != "%PDF" {
+		return nil, fmt.Errorf("полученные данные не являются валидным PDF файлом (ожидается магический байт %%PDF)")
+	}
+
+	// Формируем имя файла: если не указано, используем имя отчета с расширением .pdf
+	fileName := attach.FileName
+	if fileName == "" {
+		// Используем имя отчета (attach.File) как основу
+		reportName := attach.File
+		// Убираем расширение .rpt, если есть
+		if ext := filepath.Ext(reportName); ext == ".rpt" {
+			reportName = reportName[:len(reportName)-len(ext)]
+		}
+		// Добавляем расширение .pdf
+		fileName = reportName + ".pdf"
+	} else {
+		// Если имя указано, но нет расширения .pdf, добавляем его
+		if ext := filepath.Ext(fileName); ext != ".pdf" {
+			fileName = fileName + ".pdf"
+		}
+	}
+
 	if logger.Log != nil {
 		logger.Log.Debug("Crystal Reports отчет успешно сгенерирован",
 			zap.Int64("taskID", taskID),
+			zap.String("fileName", fileName),
 			zap.Int("size", len(data)))
 	}
 
 	return &AttachmentData{
-		FileName: attach.FileName,
+		FileName: fileName,
 		Data:     data,
 	}, nil
 }

@@ -724,13 +724,9 @@ func (s *Service) writeResponseBatch(batch []db.SaveEmailResponseParams) {
 
 // GetStatusUpdateCallback возвращает callback для обновления статуса письма
 func (s *Service) GetStatusUpdateCallback() email.StatusUpdateCallback {
-	return func(taskID int64, status int, statusDesc string) {
-		// В error_text попадают только сообщения об ошибках (статус 3)
-		// Для успешных статусов (2 и 4) error_text должен быть пустым
-		errorText := ""
-		if status == 3 {
-			errorText = statusDesc
-		}
+	return func(taskID int64, status int, statusDesc string, errorText string) {
+		// errorText передается отдельно и может быть заполнен даже при статусе 2 (например, при таймауте)
+		// Для статуса 3 errorText обычно равен statusDesc, но может быть передан отдельно
 		s.enqueueResponse(taskID, status, errorText)
 	}
 }

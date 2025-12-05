@@ -21,15 +21,15 @@ type ParsedEmailMessage struct {
 
 // Attachment представляет вложение
 type Attachment struct {
-	ReportType      int
-	FileName        string
-	ClobAttachID    *int64
-	ReportFile      string
-	Catalog         string
-	File            string
-	DbLogin         string
-	DbPass          string
-	AttachParams    map[string]string
+	ReportType   int
+	FileName     string
+	ClobAttachID *int64
+	ReportFile   string
+	Catalog      string
+	File         string
+	DbLogin      string
+	DbPass       string
+	AttachParams map[string]string
 }
 
 // ParseEmailMessage парсит данные из map в ParsedEmailMessage
@@ -90,23 +90,31 @@ func ParseEmailMessage(data map[string]interface{}) (*ParsedEmailMessage, error)
 }
 
 // ParseAttachments парсит вложения из XML
-// Вложения находятся внутри body элемента
+// Вложения находятся внутри body элемента в CDATA секции: <email><attachs><attach>...</attach></attachs></email>
 func ParseAttachments(xmlPayload string, taskID int64) ([]Attachment, error) {
 	type AttachElement struct {
-		XMLName              xml.Name
-		ReportType           string `xml:"report_type,attr"`
-		EmailAttachID        string `xml:"email_attach_id,attr"`
-		EmailAttachName      string `xml:"email_attach_name,attr"`
-		ReportFile           string `xml:"report_file,attr"`
-		EmailAttachCatalog   string `xml:"email_attach_catalog,attr"`
-		EmailAttachFile      string `xml:"email_attach_file,attr"`
-		DbLogin              string `xml:"db_login,attr"`
-		DbPass               string `xml:"db_pass,attr"`
-		InnerXML             string `xml:",innerxml"`
+		XMLName            xml.Name
+		ReportType         string `xml:"report_type,attr"`
+		EmailAttachID      string `xml:"email_attach_id,attr"`
+		EmailAttachName    string `xml:"email_attach_name,attr"`
+		ReportFile         string `xml:"report_file,attr"`
+		EmailAttachCatalog string `xml:"email_attach_catalog,attr"`
+		EmailAttachFile    string `xml:"email_attach_file,attr"`
+		DbLogin            string `xml:"db_login,attr"`
+		DbPass             string `xml:"db_pass,attr"`
+		InnerXML           string `xml:",innerxml"`
+	}
+
+	type Attachs struct {
+		Attach []AttachElement `xml:"attach"`
+	}
+
+	type Email struct {
+		Attachs Attachs `xml:"attachs"`
 	}
 
 	type Body struct {
-		Attach []AttachElement `xml:"attach"`
+		InnerXML string `xml:",innerxml"`
 	}
 
 	type Root struct {
@@ -119,9 +127,22 @@ func ParseAttachments(xmlPayload string, taskID int64) ([]Attachment, error) {
 		return nil, fmt.Errorf("ошибка парсинга XML для вложений: %w", err)
 	}
 
+	// Извлекаем содержимое из CDATA, если оно там есть
+	bodyXML := extractCDATAContent(root.Body.InnerXML)
+	if bodyXML == "" {
+		// Нет вложений - возвращаем пустой список
+		return []Attachment{}, nil
+	}
+
+	// Парсим внутренний XML из email
+	var email Email
+	if err := xml.Unmarshal([]byte(bodyXML), &email); err != nil {
+		return nil, fmt.Errorf("ошибка парсинга email XML: %w, body content: %s", err, truncateString(bodyXML, 500))
+	}
+
 	var attachments []Attachment
 
-	for _, attachElem := range root.Body.Attach {
+	for _, attachElem := range email.Attachs.Attach {
 		if attachElem.ReportType == "" {
 			return nil, fmt.Errorf("не указан report_type вложения")
 		}
@@ -133,7 +154,7 @@ func ParseAttachments(xmlPayload string, taskID int64) ([]Attachment, error) {
 
 		attach := Attachment{
 			ReportType: reportType,
-			FileName:    attachElem.EmailAttachName,
+			FileName:   attachElem.EmailAttachName,
 		}
 
 		switch reportType {
@@ -172,9 +193,14 @@ func ParseAttachments(xmlPayload string, taskID int64) ([]Attachment, error) {
 			if attachElem.InnerXML != "" {
 				params, err := parseAttachParams(attachElem.InnerXML)
 				if err != nil {
-					return nil, fmt.Errorf("ошибка парсинга параметров вложений: %w", err)
+					// Если не удалось распарсить параметры, продолжаем без них
+					// Это не критическая ошибка - вложение может быть обработано и без параметров
+					attach.AttachParams = make(map[string]string)
+				} else {
+					attach.AttachParams = params
 				}
-				attach.AttachParams = params
+			} else {
+				attach.AttachParams = make(map[string]string)
 			}
 		}
 
@@ -185,16 +211,21 @@ func ParseAttachments(xmlPayload string, taskID int64) ([]Attachment, error) {
 }
 
 // parseAttachParams парсит параметры вложений из XML
+// Структура: <attach><attach_params><attach_param .../></attach_params></attach>
 func parseAttachParams(xmlStr string) (map[string]string, error) {
 	type AttachParam struct {
-		XMLName              xml.Name
+		XMLName               xml.Name
 		EmailAttachParamName  string `xml:"email_attach_param_name,attr"`
 		EmailAttachParamValue string `xml:"email_attach_param_value,attr"`
 	}
 
-	type Root struct {
-		XMLName     xml.Name `xml:"attach"`
+	type AttachParams struct {
 		AttachParam []AttachParam `xml:"attach_param"`
+	}
+
+	type Root struct {
+		XMLName      xml.Name     `xml:"attach"`
+		AttachParams AttachParams `xml:"attach_params"`
 	}
 
 	var root Root
@@ -203,7 +234,7 @@ func parseAttachParams(xmlStr string) (map[string]string, error) {
 	}
 
 	params := make(map[string]string)
-	for _, param := range root.AttachParam {
+	for _, param := range root.AttachParams.AttachParam {
 		if param.EmailAttachParamName != "" {
 			params[param.EmailAttachParamName] = param.EmailAttachParamValue
 		}
@@ -212,3 +243,39 @@ func parseAttachParams(xmlStr string) (map[string]string, error) {
 	return params, nil
 }
 
+// extractCDATAContent извлекает содержимое из CDATA секции
+func extractCDATAContent(s string) string {
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return s
+	}
+
+	cdataStart := "<![CDATA["
+	cdataEnd := "]]>"
+
+	startIdx := strings.Index(s, cdataStart)
+	if startIdx != -1 {
+		endIdx := strings.Index(s[startIdx+len(cdataStart):], cdataEnd)
+		if endIdx != -1 {
+			contentStart := startIdx + len(cdataStart)
+			contentEnd := startIdx + len(cdataStart) + endIdx
+			content := s[contentStart:contentEnd]
+			return strings.TrimSpace(content)
+		}
+	}
+
+	// Если нет CDATA, но строка начинается с <, возвращаем как есть
+	if strings.HasPrefix(strings.TrimSpace(s), "<") {
+		return s
+	}
+
+	return s
+}
+
+// truncateString обрезает строку до указанной длины
+func truncateString(s string, maxLen int) string {
+	if len(s) <= maxLen {
+		return s
+	}
+	return s[:maxLen] + "..."
+}
