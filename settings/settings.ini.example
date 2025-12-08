@@ -48,3 +48,8 @@ TimeEnd = 21:00
 LogLevel = 4
 MaxArchiveFiles = 10
 
+[share]
+CIFSUSERNAME = vsaradjev
+CIFSPASSWORD = hUqtev-6xoxce-hyhxyx
+CIFSDOMEN =
+CIFSPORT = 445

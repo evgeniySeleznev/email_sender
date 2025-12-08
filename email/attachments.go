@@ -7,22 +7,31 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"strings"
 
 	"go.uber.org/zap"
 
 	"email-service/db"
 	"email-service/logger"
+	"email-service/settings"
+	"email-service/storage"
 )
 
 // AttachmentProcessor обрабатывает вложения разных типов
 type AttachmentProcessor struct {
-	dbConn *db.DBConnection
+	dbConn      *db.DBConnection
+	cifsManager *storage.CIFSManager
 }
 
 // NewAttachmentProcessor создает новый процессор вложений
-func NewAttachmentProcessor(dbConn *db.DBConnection) *AttachmentProcessor {
+func NewAttachmentProcessor(dbConn *db.DBConnection, cfg *settings.Config) *AttachmentProcessor {
+	var cifsManager *storage.CIFSManager
+	if cfg != nil {
+		cifsManager = storage.NewCIFSManager(&cfg.Share)
+	}
 	return &AttachmentProcessor{
-		dbConn: dbConn,
+		dbConn:      dbConn,
+		cifsManager: cifsManager,
 	}
 }
 
@@ -36,7 +45,7 @@ func (p *AttachmentProcessor) ProcessAttachment(ctx context.Context, attach *Att
 		// Тип 2: CLOB из БД
 		return p.processCLOB(ctx, attach, taskID)
 	case 3:
-		// Тип 3: Готовый файл
+		// Тип 3: Готовый файл (поддерживает локальные пути и UNC пути через CIFS/SMB)
 		return p.processFile(ctx, attach)
 	default:
 		return nil, fmt.Errorf("неизвестный тип вложения: %d", attach.ReportType)
@@ -81,11 +90,11 @@ func (p *AttachmentProcessor) processCrystalReport(ctx context.Context, attach *
 	reportRequest := &ReportRequest{
 		Main: MainInfo{
 			ApplicationName: attach.Catalog,
-			DBInstance:     dbInstance,
-			DBPass:         attach.DbPass,
-			DBUser:         attach.DbLogin,
-			ExportFormat:   ExportFormatPDF,
-			ReportName:     attach.File,
+			DBInstance:      dbInstance,
+			DBPass:          attach.DbPass,
+			DBUser:          attach.DbLogin,
+			ExportFormat:    ExportFormatPDF,
+			ReportName:      attach.File,
 		},
 	}
 
@@ -223,7 +232,7 @@ func (p *AttachmentProcessor) processCLOB(ctx context.Context, attach *Attachmen
 	}, nil
 }
 
-// processFile обрабатывает готовый файл
+// processFile обрабатывает готовый файл (поддерживает локальные пути и UNC пути)
 func (p *AttachmentProcessor) processFile(ctx context.Context, attach *Attachment) (*AttachmentData, error) {
 	if attach.ReportFile == "" {
 		return nil, fmt.Errorf("не указан ReportFile для типа 3")
@@ -234,6 +243,15 @@ func (p *AttachmentProcessor) processFile(ctx context.Context, attach *Attachmen
 			zap.String("file", attach.ReportFile))
 	}
 
+	// Проверяем, является ли путь UNC путем (начинается с \\ или //)
+	isUNCPath := strings.HasPrefix(attach.ReportFile, `\\`) || strings.HasPrefix(attach.ReportFile, `//`)
+
+	if isUNCPath {
+		// Обрабатываем UNC путь через CIFS/SMB
+		return p.processUNCFile(ctx, attach)
+	}
+
+	// Обрабатываем локальный путь
 	// Валидация пути для безопасности
 	if !filepath.IsAbs(attach.ReportFile) {
 		return nil, fmt.Errorf("путь к файлу должен быть абсолютным: %s", attach.ReportFile)
@@ -282,6 +300,63 @@ func (p *AttachmentProcessor) processFile(ctx context.Context, attach *Attachmen
 
 	if logger.Log != nil {
 		logger.Log.Debug("Файл вложения успешно прочитан",
+			zap.String("file", attach.ReportFile),
+			zap.Int("size", len(data)))
+	}
+
+	return &AttachmentData{
+		FileName: attach.FileName,
+		Data:     data,
+	}, nil
+}
+
+// processUNCFile обрабатывает файл по UNC пути через CIFS/SMB
+func (p *AttachmentProcessor) processUNCFile(ctx context.Context, attach *Attachment) (*AttachmentData, error) {
+	if p.cifsManager == nil {
+		return nil, fmt.Errorf("CIFS менеджер не инициализирован, проверьте настройки [share] в конфигурации")
+	}
+
+	// Парсим UNC путь: \\192.168.87.31\shares$\esig_docs\OBN\SEMD\2021\08\ASK_6365065_1.XML
+	server, share, relPath, err := storage.ParseUNCPath(attach.ReportFile)
+	if err != nil {
+		return nil, fmt.Errorf("ошибка парсинга UNC пути %s: %w", attach.ReportFile, err)
+	}
+
+	if logger.Log != nil {
+		logger.Log.Debug("Обработка файла через CIFS",
+			zap.String("server", server),
+			zap.String("share", share),
+			zap.String("relPath", relPath))
+	}
+
+	// Получаем клиент для подключения к шаре
+	client, err := p.cifsManager.GetClient(ctx, server, share)
+	if err != nil {
+		return nil, fmt.Errorf("ошибка подключения к CIFS шаре %s\\%s: %w", server, share, err)
+	}
+
+	// Проверяем существование файла
+	exists, err := client.FileExists(relPath)
+	if err != nil {
+		return nil, fmt.Errorf("ошибка проверки существования файла %s: %w", attach.ReportFile, err)
+	}
+	if !exists {
+		return nil, fmt.Errorf("файл не найден на шаре: %s", attach.ReportFile)
+	}
+
+	// Читаем файл с шары
+	data, err := client.ReadFile(relPath)
+	if err != nil {
+		return nil, fmt.Errorf("ошибка чтения файла с шары %s: %w", attach.ReportFile, err)
+	}
+
+	// Проверяем, что файл не пустой
+	if len(data) == 0 {
+		return nil, fmt.Errorf("файл вложения пустой (размер 0 байт): %s", attach.ReportFile)
+	}
+
+	if logger.Log != nil {
+		logger.Log.Debug("Файл успешно прочитан с CIFS шары",
 			zap.String("file", attach.ReportFile),
 			zap.Int("size", len(data)))
 	}

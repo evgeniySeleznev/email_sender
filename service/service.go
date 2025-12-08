@@ -126,9 +126,25 @@ func (s *Service) Run(ctx context.Context, wg *sync.WaitGroup) {
 		// Передаем контекст для возможности отмены операций при graceful shutdown
 		var messages []*db.QueueMessage
 		var err error
-		if s.dbConn.CheckConnection() {
-			messages, err = s.queueReader.DequeueMany(ctx, 100) // Читаем до 100 сообщений как в smsSender
+
+		// Проверяем соединение перед вызовом DequeueMany
+		if !s.dbConn.CheckConnection() {
+			// Соединение потеряно - пытаемся переподключиться с использованием таймаута подключения
+			logger.Log.Warn("Соединение с БД потеряно, переподключение...")
+			if err := s.dbConn.Reconnect(); err != nil {
+				logger.Log.Error("Ошибка переподключения", zap.Error(err))
+				// Используем таймаут подключения (10 секунд) вместо короткой паузы
+				if !s.sleepWithContext(ctx, 10*time.Second) {
+					return
+				}
+				continue
+			}
+			// После успешного переподключения продолжаем цикл для попытки чтения
+			continue
 		}
+
+		// Соединение установлено - пытаемся прочитать сообщения
+		messages, err = s.queueReader.DequeueMany(ctx, 100) // Читаем до 100 сообщений как в smsSender
 
 		// Отправляем сигнал в горутину о получении ответа (независимо от результата)
 		close(iterationSignalChan)
@@ -725,8 +741,6 @@ func (s *Service) writeResponseBatch(batch []db.SaveEmailResponseParams) {
 // GetStatusUpdateCallback возвращает callback для обновления статуса письма
 func (s *Service) GetStatusUpdateCallback() email.StatusUpdateCallback {
 	return func(taskID int64, status int, statusDesc string, errorText string) {
-		// errorText передается отдельно и может быть заполнен даже при статусе 2 (например, при таймауте)
-		// Для статуса 3 errorText обычно равен statusDesc, но может быть передан отдельно
 		s.enqueueResponse(taskID, status, errorText)
 	}
 }

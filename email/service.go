@@ -42,7 +42,7 @@ func NewService(cfg *settings.Config, dbConn *db.DBConnection, statusCallback St
 		cfg:                 cfg,
 		dbConn:              dbConn,
 		smtpClients:         smtpClients,
-		attachmentProcessor: NewAttachmentProcessor(dbConn),
+		attachmentProcessor: NewAttachmentProcessor(dbConn, cfg),
 		testEmailCacheTTL:   5 * time.Minute, // Кеш тестового email на 5 минут
 		statusChecker:       NewStatusChecker(cfg, statusCallback),
 	}

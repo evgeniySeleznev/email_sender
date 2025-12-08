@@ -15,6 +15,7 @@ type Config struct {
 	Mode     ModeConfig
 	Schedule ScheduleConfig
 	Log      LogConfig
+	Share    ShareConfig
 }
 
 // OracleConfig представляет конфигурацию Oracle
@@ -61,6 +62,14 @@ type LogConfig struct {
 	MaxArchiveFiles int
 }
 
+// ShareConfig представляет конфигурацию для доступа к CIFS/SMB шарам
+type ShareConfig struct {
+	Username string
+	Password string
+	Domain   string
+	Port     string
+}
+
 // LoadConfig загружает конфигурацию из INI файла
 func LoadConfig(path string) (*Config, error) {
 	cfg, err := ini.Load(path)
@@ -95,6 +104,11 @@ func LoadConfig(path string) (*Config, error) {
 	// Загружаем конфигурацию логирования
 	if err := config.loadLogConfig(); err != nil {
 		return nil, fmt.Errorf("ошибка загрузки конфигурации логирования: %w", err)
+	}
+
+	// Загружаем конфигурацию CIFS/SMB шары
+	if err := config.loadShareConfig(); err != nil {
+		return nil, fmt.Errorf("ошибка загрузки конфигурации Share: %w", err)
 	}
 
 	return config, nil
@@ -257,6 +271,27 @@ func (c *Config) loadLogConfig() error {
 	sec := c.File.Section("Log")
 	c.Log.LogLevel = sec.Key("LogLevel").MustInt(4) // По умолчанию Info
 	c.Log.MaxArchiveFiles = sec.Key("MaxArchiveFiles").MustInt(10)
+
+	return nil
+}
+
+func (c *Config) loadShareConfig() error {
+	if !c.File.HasSection("share") {
+		// Секция не обязательна, используем значения по умолчанию
+		c.Share.Port = "445"
+		return nil
+	}
+
+	sec := c.File.Section("share")
+	c.Share.Username = sec.Key("CIFSUSERNAME").String()
+	c.Share.Password = sec.Key("CIFSPASSWORD").String()
+	c.Share.Domain = sec.Key("CIFSDOMEN").String()
+	c.Share.Port = sec.Key("CIFSPORT").String()
+
+	// Значение по умолчанию для порта
+	if c.Share.Port == "" {
+		c.Share.Port = "445"
+	}
 
 	return nil
 }
