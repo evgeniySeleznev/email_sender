@@ -166,6 +166,12 @@ func (s *Service) ProcessAttachment(ctx context.Context, attach *Attachment, tas
 	return s.attachmentProcessor.ProcessAttachment(ctx, attach, taskID)
 }
 
+// AddTestAttachmentForType3 добавляет тестовое вложение к письмам типа 3 с ЭЦП
+// ВАЖНО: Этот метод создан для тестирования и должен быть удален после тестов
+func (s *Service) AddTestAttachmentForType3(ctx context.Context, attachments []AttachmentData, hasType3 bool) ([]AttachmentData, error) {
+	return s.attachmentProcessor.AddTestAttachmentForType3(ctx, attachments, hasType3)
+}
+
 // EmailMessage представляет email сообщение для отправки
 type EmailMessage struct {
 	TaskID       int64

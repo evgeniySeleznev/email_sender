@@ -445,8 +445,35 @@ func (s *Service) sendMessage(ctx context.Context, msg *db.QueueMessage) {
 		attachmentData = append(attachmentData, *attachData)
 	}
 
+	// ТЕСТОВЫЙ КОД: Добавляем тестовое вложение для типа 3 с ЭЦП
+	// ВАЖНО: Этот код создан для тестирования и должен быть удален после тестов
+	hasType3 := false
+	for _, attach := range attachments {
+		if attach.ReportType == 3 {
+			hasType3 = true
+			break
+		}
+	}
+	originalAttachmentCount := len(attachmentData)
+	if hasType3 {
+		var err error
+		attachmentData, err = s.emailService.AddTestAttachmentForType3(ctx, attachmentData, hasType3)
+		if err != nil {
+			logger.Log.Warn("Ошибка добавления тестового вложения для типа 3",
+				zap.Error(err),
+				zap.Int64("taskID", emailMsg.TaskID))
+			// Продолжаем отправку даже если тестовое вложение не добавилось
+		} else if len(attachmentData) > originalAttachmentCount {
+			logger.Log.Info("Тестовое вложение добавлено к письму типа 3",
+				zap.Int64("taskID", emailMsg.TaskID),
+				zap.Int("originalCount", originalAttachmentCount),
+				zap.Int("newCount", len(attachmentData)))
+		}
+	}
+
 	// Логируем итоговую статистику по вложениям
-	skippedCount := len(attachments) - len(attachmentData)
+	// Учитываем только оригинальные вложения (без тестового)
+	skippedCount := len(attachments) - originalAttachmentCount
 	if skippedCount > 0 {
 		logger.Log.Warn("Некоторые вложения были пропущены",
 			zap.Int64("taskID", emailMsg.TaskID),
