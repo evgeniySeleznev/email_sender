@@ -5,6 +5,7 @@ go 1.25.0
 require (
 	github.com/emersion/go-imap v1.2.1
 	github.com/godror/godror v0.49.5
+	github.com/google/uuid v1.6.0
 	github.com/hirochachacha/go-smb2 v1.1.0
 	go.uber.org/zap v1.27.1
 	gopkg.in/ini.v1 v1.67.0

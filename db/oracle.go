@@ -238,6 +238,9 @@ func (d *DBConnection) GetActiveOperationsCount() int32 {
 
 // openConnectionInternal внутренний метод открытия соединения без блокировки
 func (d *DBConnection) openConnectionInternal() error {
+	if logger.Log != nil {
+		logger.Log.Info("openConnectionInternal: начало открытия соединения")
+	}
 	// Получаем параметры подключения из конфигурации
 	// Для совместимости с существующим форматом используем секцию [ORACLE]
 	oracleSec := d.cfg.File.Section("ORACLE")
@@ -278,14 +281,64 @@ func (d *DBConnection) openConnectionInternal() error {
 	db.SetConnMaxIdleTime(5 * time.Minute)
 
 	// Проверка соединения с таймаутом
-	pingCtx, pingCancel := context.WithTimeout(context.Background(), connectionTimeout)
-	defer pingCancel()
-	if err := db.PingContext(pingCtx); err != nil {
+	// Используем горутину для гарантированного таймаута, т.к. PingContext может зависать
+	// на уровне ОС (DNS, TCP) до того, как контекст сможет отменить операцию
+	if logger.Log != nil {
+		logger.Log.Info("openConnectionInternal: выполнение PingContext с таймаутом",
+			zap.Duration("timeout", connectionTimeout))
+	}
+
+	// Создаем таймер для гарантированного таймаута
+	timeoutTimer := time.NewTimer(connectionTimeout)
+	defer timeoutTimer.Stop()
+
+	// Канал для результата ping
+	pingDone := make(chan error, 1)
+
+	// Запускаем PingContext в горутине
+	// Используем background context, т.к. реальный таймаут контролируется таймером
+	go func() {
+		// Создаем контекст с таймаутом для PingContext (на случай если он все же поддерживает отмену)
+		pingCtx, pingCancel := context.WithTimeout(context.Background(), connectionTimeout+time.Second)
+		defer pingCancel()
+
+		err := db.PingContext(pingCtx)
+		select {
+		case pingDone <- err:
+			// Результат отправлен
+		default:
+			// Канал уже закрыт (таймаут), игнорируем результат
+		}
+	}()
+
+	select {
+	case err := <-pingDone:
+		// Ping завершился (успешно или с ошибкой)
+		if err != nil {
+			_ = db.Close()
+			if logger.Log != nil {
+				logger.Log.Error("openConnectionInternal: ошибка ping", zap.Error(err))
+			}
+			return fmt.Errorf("ошибка ping: %w", err)
+		}
+		if logger.Log != nil {
+			logger.Log.Info("openConnectionInternal: PingContext успешно выполнен")
+		}
+	case <-timeoutTimer.C:
+		// Таймаут истек - принудительно закрываем соединение
 		_ = db.Close()
 		if logger.Log != nil {
-			logger.Log.Error("Ошибка ping", zap.Error(err))
+			logger.Log.Error("openConnectionInternal: таймаут PingContext истек",
+				zap.Duration("timeout", connectionTimeout))
 		}
-		return fmt.Errorf("ошибка ping: %w", err)
+		// Ждем немного, чтобы горутина могла завершиться (но не блокируемся навсегда)
+		select {
+		case <-pingDone:
+			// Горутина завершилась, игнорируем результат
+		case <-time.After(100 * time.Millisecond):
+			// Не ждем дольше 100мс
+		}
+		return fmt.Errorf("таймаут подключения к БД (%v): операция не завершилась в течение указанного времени", connectionTimeout)
 	}
 	d.db = db
 	d.lastReconnect = time.Now()

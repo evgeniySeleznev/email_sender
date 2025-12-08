@@ -33,13 +33,19 @@ func main() {
 
 	shutdownRequested := setupSignalHandling()
 
+	logger.Log.Info("Инициализация QueueReader...")
 	queueReader := initializeQueueReader(dbConn)
+	logger.Log.Info("Создание основного сервиса...")
 	mainService := service.NewService(cfg, dbConn, queueReader)
+	logger.Log.Info("Создание email сервиса...")
 	emailService := initializeEmailService(cfg, dbConn, mainService.GetStatusUpdateCallback())
+	logger.Log.Info("Установка email сервиса в основной сервис...")
 	mainService.SetEmailService(emailService)
 
 	var allHandlersWg sync.WaitGroup
+	logger.Log.Info("Запуск основного сервиса...")
 	startMainService(ctx, mainService, &allHandlersWg)
+	logger.Log.Info("Основной сервис запущен, ожидание сигнала завершения...")
 
 	<-shutdownRequested
 	shutdown(ctx, cancel, mainService, emailService, dbConn, &allHandlersWg)
@@ -125,9 +131,13 @@ func initializeEmailService(cfg *settings.Config, dbConn *db.DBConnection, statu
 
 // startMainService запускает основной цикл обработки сообщений
 func startMainService(ctx context.Context, mainService *service.Service, wg *sync.WaitGroup) {
+	logger.Log.Info("Запуск горутины основного сервиса...")
 	go func() {
+		logger.Log.Info("Горутина основного сервиса запущена, вызов Run()...")
 		mainService.Run(ctx, wg)
+		logger.Log.Info("Горутина основного сервиса завершена")
 	}()
+	logger.Log.Info("Горутина основного сервиса запущена (асинхронно)")
 }
 
 // shutdown выполняет graceful shutdown приложения

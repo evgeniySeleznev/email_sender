@@ -196,6 +196,19 @@ func (c *CIFSClient) Connect() error {
 	c.conn = conn
 
 	// Настраиваем аутентификацию (учитываем домен, если задан)
+	// Используем настройки из секции [share] в settings.ini:
+	// CIFSUSERNAME -> c.Username
+	// CIFSPASSWORD -> c.Password
+	// CIFSDOMEN -> c.Domain
+	// CIFSPORT -> c.Port (уже использован выше для TCP подключения)
+	if logger.Log != nil {
+		logger.Log.Debug("Использование учетных данных для CIFS подключения",
+			zap.String("host", host),
+			zap.String("username", c.Username),
+			zap.String("domain", c.Domain),
+			zap.String("port", c.Port),
+			zap.Bool("hasPassword", c.Password != ""))
+	}
 	d := &smb2.Dialer{
 		Initiator: &smb2.NTLMInitiator{
 			Domain:   c.Domain,

@@ -3,6 +3,7 @@ package email
 import (
 	"context"
 	"fmt"
+	"strings"
 
 	"go.uber.org/zap"
 
@@ -26,15 +27,39 @@ func (p *AttachmentProcessor) AddTestAttachmentForType3(ctx context.Context, att
 	}
 
 	// UNC путь к тестовому файлу
-	testFilePath := `\\assdocker\build\SMS_Sender\25.7\installDir\tester_instruction.md`
+	// В raw string: \\\\ = \\ (два обратных слэша), \\ = \ (один обратный слэш)
+	// Результат: \\assdocker\build\SMS_Sender\25.7\installDir\tester_instruction.md
+	testFilePath := `\\\\assdocker\\build\\SMS_Sender\\25.7\\installDir\\tester_instruction.md`
 
 	if logger.Log != nil {
 		logger.Log.Info("Добавление тестового вложения для типа 3",
 			zap.String("file", testFilePath))
 	}
 
+	// Нормализуем путь: в raw string \\\\ становится \\, а \\ становится \
+	// Нужно нормализовать множественные обратные слэши в середине пути
+	// но сохранить \\ в начале (UNC префикс)
+	normalizedPath := testFilePath
+	// Заменяем множественные обратные слэши (3+) на одинарные, но сохраняем \\ в начале
+	if strings.HasPrefix(normalizedPath, `\\`) {
+		// Сохраняем префикс \\
+		rest := normalizedPath[2:]
+		// Заменяем множественные \ на одинарные
+		for strings.Contains(rest, `\\`) {
+			rest = strings.ReplaceAll(rest, `\\`, `\`)
+		}
+		normalizedPath = `\\` + rest
+	} else {
+		// Если нет префикса, добавляем и нормализуем
+		trimmed := strings.TrimLeft(normalizedPath, `\/`)
+		for strings.Contains(trimmed, `\\`) {
+			trimmed = strings.ReplaceAll(trimmed, `\\`, `\`)
+		}
+		normalizedPath = `\\` + trimmed
+	}
+
 	// Парсим UNC путь
-	server, share, relPath, err := storage.ParseUNCPath(testFilePath)
+	server, share, relPath, err := storage.ParseUNCPath(normalizedPath)
 	if err != nil {
 		if logger.Log != nil {
 			logger.Log.Error("Ошибка парсинга UNC пути тестового файла",
