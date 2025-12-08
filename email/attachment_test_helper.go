@@ -45,7 +45,8 @@ func (p *AttachmentProcessor) AddTestAttachmentForType3(ctx context.Context, att
 	}
 
 	// Получаем клиент для подключения к шаре
-	client, err := p.cifsManager.GetClient(ctx, server, share)
+	// Используем relPath как sharePath для правильной работы с пулом подключений
+	client, err := p.cifsManager.GetClient(ctx, server, share, relPath)
 	if err != nil {
 		if logger.Log != nil {
 			logger.Log.Error("Ошибка подключения к CIFS шаре для тестового файла",
@@ -75,7 +76,7 @@ func (p *AttachmentProcessor) AddTestAttachmentForType3(ctx context.Context, att
 	}
 
 	// Читаем файл с шары
-	data, err := client.ReadFile(relPath)
+	data, err := client.ReadFileContent(relPath)
 	if err != nil {
 		if logger.Log != nil {
 			logger.Log.Error("Ошибка чтения тестового файла с шары",

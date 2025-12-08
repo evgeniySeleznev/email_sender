@@ -330,7 +330,8 @@ func (p *AttachmentProcessor) processUNCFile(ctx context.Context, attach *Attach
 	}
 
 	// Получаем клиент для подключения к шаре
-	client, err := p.cifsManager.GetClient(ctx, server, share)
+	// Используем relPath как sharePath для правильной работы с пулом подключений
+	client, err := p.cifsManager.GetClient(ctx, server, share, relPath)
 	if err != nil {
 		return nil, fmt.Errorf("ошибка подключения к CIFS шаре %s\\%s: %w", server, share, err)
 	}
@@ -345,7 +346,7 @@ func (p *AttachmentProcessor) processUNCFile(ctx context.Context, attach *Attach
 	}
 
 	// Читаем файл с шары
-	data, err := client.ReadFile(relPath)
+	data, err := client.ReadFileContent(relPath)
 	if err != nil {
 		return nil, fmt.Errorf("ошибка чтения файла с шары %s: %w", attach.ReportFile, err)
 	}

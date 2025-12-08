@@ -6,10 +6,13 @@ import (
 	"io"
 	"net"
 	"os"
+	"path"
+	"path/filepath"
 	"strings"
 	"sync"
 	"time"
 
+	"github.com/google/uuid"
 	"github.com/hirochachacha/go-smb2"
 	"go.uber.org/zap"
 
@@ -64,11 +67,11 @@ func NewCIFSClient(address string, shareName string, cfg *settings.ShareConfig) 
 // ==================== CIFSManager методы ====================
 
 // GetClient возвращает клиент для указанного сервера и шары
-func (m *CIFSManager) GetClient(ctx context.Context, server, share string) (*CIFSClient, error) {
-	key := server + ":" + share
+func (m *CIFSManager) GetClient(ctx context.Context, server, share string, sharePath string) (*CIFSClient, error) {
+	key := server + ":" + share + ":" + sharePath + ":" + uuid.New().String()
 
 	if logger.Log != nil {
-		logger.Log.Debug("Получение CIFS клиента",
+		logger.Log.Info("GetClient",
 			zap.String("server", server),
 			zap.String("share", share))
 	}
@@ -136,7 +139,7 @@ func (m *CIFSManager) CleanupIdleConnections(maxIdleTime time.Duration) {
 	for key, client := range m.clients {
 		if client != nil && time.Since(client.lastUsed) > maxIdleTime {
 			if logger.Log != nil {
-				logger.Log.Debug("CIFSManager: очистка неиспользуемого подключения",
+				logger.Log.Info("CIFSManager: очистка неиспользуемого подключения",
 					zap.String("key", key))
 			}
 			client.Disconnect()
@@ -258,7 +261,6 @@ func (c *CIFSClient) EnsureConnected() error {
 
 	return nil
 }
-
 func (c *CIFSClient) readyFS() (*smb2.Share, error) {
 	if c.fs != nil {
 		// быстрая проверка «живости» – читаем корень
@@ -332,24 +334,184 @@ func (c *CIFSClient) Disconnect() {
 }
 
 // ==================== Файловые операции ====================
-
-// OpenFile открывает файл на шаре для чтения
-func (c *CIFSClient) OpenFile(filePath string) (io.ReadCloser, error) {
+func (c *CIFSClient) ReadFile(dirPath string) ([]string, error) {
 	const maxTries = 2
 	for attempt := 0; attempt < maxTries; attempt++ {
-		file, err := c.openFileOnce(filePath)
+		paths, err := c.readFileOnce(dirPath)
 		if err != nil && attempt == 0 {
 			if _, rerr := c.readyFS(); rerr != nil {
 				return nil, rerr
 			}
 			continue
 		}
-		return file, err
+		return paths, err
 	}
-	return nil, fmt.Errorf("не удалось открыть файл после %d попыток", maxTries)
+	return nil, nil
 }
 
-func (c *CIFSClient) openFileOnce(filePath string) (io.ReadCloser, error) {
+// ReadFile читает файлы из директории на шаре
+func (c *CIFSClient) readFileOnce(dirPath string) ([]string, error) {
+	if c.fs == nil {
+		return nil, fmt.Errorf("шара не смонтирована: вызовите Connect() перед ReadFile")
+	}
+
+	entries, err := c.fs.ReadDir(dirPath)
+	if err != nil {
+		return nil, fmt.Errorf("ошибка чтения папки %s на шаре: %w", dirPath, err)
+	}
+
+	const workers = 64
+	sem := make(chan struct{}, workers)
+	type result struct {
+		path string
+	}
+
+	results := make([]result, 0, len(entries))
+	var (
+		mu sync.Mutex
+		wg sync.WaitGroup
+	)
+
+	for _, e := range entries {
+		if e.IsDir() {
+			continue
+		}
+		name := e.Name()
+		wg.Add(1)
+
+		go func(n string) {
+			defer wg.Done()
+
+			sem <- struct{}{}
+			defer func() { <-sem }()
+
+			full := filepath.Join(dirPath, n)
+			st, err := c.fs.Stat(full)
+			if err != nil || st.IsDir() {
+				return
+			}
+
+			mu.Lock()
+			results = append(results, result{path: full})
+			mu.Unlock()
+		}(name)
+	}
+	wg.Wait()
+
+	paths := make([]string, 0, len(results))
+	for _, r := range results {
+		paths = append(paths, r.path)
+	}
+
+	if logger.Log != nil {
+		logger.Log.Info("Найдено файлов в папке",
+			zap.Int("count", len(paths)),
+			zap.String("dirPath", dirPath))
+	}
+	return paths, nil
+}
+func (c *CIFSClient) FindFileBySuffix(dirPath, suffix string) (string, bool, error) {
+	if c.fs == nil {
+		return "", false, fmt.Errorf("шара не смонтирована")
+	}
+
+	entries, err := c.fs.ReadDir(dirPath)
+	if err != nil {
+		return "", false, fmt.Errorf("read dir: %w", err)
+	}
+
+	for _, e := range entries {
+		name := e.Name()
+		if logger.Log != nil {
+			logger.Log.Debug("Проверка файла",
+				zap.String("name", name),
+				zap.Bool("isDir", e.IsDir()))
+		}
+		if !e.IsDir() && strings.HasSuffix(name, suffix) {
+			full := path.Join(dirPath, name)
+			return full, true, nil
+		}
+	}
+	return "", false, nil
+}
+
+var writeSema = make(chan struct{}, 50)
+
+// WriteStream записывает данные из io.Reader на шару
+func (c *CIFSClient) WriteStream(destPath string, src io.Reader) (int64, error) {
+	const maxTries = 2
+	for attempt := 0; attempt < maxTries; attempt++ {
+		written, err := c.writeStreamOnce(destPath, src)
+		if err != nil {
+			if attempt == 0 {
+				if logger.Log != nil {
+					logger.Log.Warn("WriteStream: ошибка ввода-вывода, пробуем восстановить соединение")
+				}
+				if _, rerr := c.readyFS(); rerr != nil {
+					return 0, rerr
+				}
+				continue
+			}
+			return 0, err
+		}
+		return written, nil
+	}
+	return 0, nil
+}
+
+// writeStreamOnce потоковая запись из io.Reader
+func (c *CIFSClient) writeStreamOnce(destPath string, src io.Reader) (int64, error) {
+	writeSema <- struct{}{}
+	defer func() { <-writeSema }()
+
+	if c.fs == nil {
+		return 0, fmt.Errorf("шара не смонтирована: вызовите Connect() перед WriteStream")
+	}
+
+	dir := parentDirFromSMBPath(destPath)
+	if err := c.ensureRemoteDirAll(dir); err != nil {
+		return 0, err
+	}
+
+	cleanPath := strings.ReplaceAll(destPath, `\`, `/`)
+	remoteDir := path.Dir(cleanPath)
+	fileName := path.Base(cleanPath)
+
+	suffix := fileName
+	if idx := strings.LastIndex(fileName, "_"); idx != -1 {
+		suffix = fileName[idx+1:]
+	}
+
+	if logger.Log != nil {
+		logger.Log.Info("Запись файла на шару",
+			zap.String("remoteDir", remoteDir))
+	}
+	if existing, found, err := c.FindFileBySuffix(remoteDir, suffix); err != nil {
+		return 0, fmt.Errorf("ошибка поиска существующего файла: %w", err)
+	} else if found {
+		if logger.Log != nil {
+			logger.Log.Warn("Файл уже существует, пропускаем",
+				zap.String("file", existing))
+		}
+		return 0, nil
+	}
+
+	dst, err := c.fs.OpenFile(destPath, os.O_CREATE|os.O_WRONLY, 0644)
+	if err != nil {
+		return 0, fmt.Errorf("не удалось создать файл на шаре %s: %w", destPath, err)
+	}
+	defer dst.Close()
+
+	buf := make([]byte, 32*1024)
+	written, err := io.CopyBuffer(dst, src, buf)
+	if err != nil {
+		return 0, fmt.Errorf("ошибка потоковой записи на шару: %w", err)
+	}
+	time.Sleep(50 * time.Millisecond)
+	return written, nil
+}
+
+func (c *CIFSClient) OpenFile(filePath string) (io.ReadCloser, error) {
 	if c.fs == nil {
 		return nil, fmt.Errorf("шара не смонтирована: вызовите Connect() перед OpenFile")
 	}
@@ -379,8 +541,23 @@ func (c *CIFSClient) FileExists(filePath string) (bool, error) {
 	return true, nil
 }
 
-// ReadFile читает файл с шары полностью
-func (c *CIFSClient) ReadFile(filePath string) ([]byte, error) {
+// ReadFileContent читает файл с шары полностью (добавлено для текущего проекта)
+func (c *CIFSClient) ReadFileContent(filePath string) ([]byte, error) {
+	const maxTries = 2
+	for attempt := 0; attempt < maxTries; attempt++ {
+		data, err := c.readFileContentOnce(filePath)
+		if err != nil && attempt == 0 {
+			if _, rerr := c.readyFS(); rerr != nil {
+				return nil, rerr
+			}
+			continue
+		}
+		return data, err
+	}
+	return nil, fmt.Errorf("не удалось прочитать файл после %d попыток", maxTries)
+}
+
+func (c *CIFSClient) readFileContentOnce(filePath string) ([]byte, error) {
 	file, err := c.OpenFile(filePath)
 	if err != nil {
 		return nil, err
@@ -393,6 +570,74 @@ func (c *CIFSClient) ReadFile(filePath string) ([]byte, error) {
 	}
 
 	return data, nil
+}
+
+// ListRoot — выводит и возвращает список элементов в корне смонтированной шары
+func (c *CIFSClient) ListRoot(relativePath string) ([]string, error) {
+	if c.fs == nil {
+		return nil, fmt.Errorf("шара не смонтирована: вызовите Connect() перед ListRoot")
+	}
+
+	entries, err := c.fs.ReadDir(relativePath)
+	if err != nil {
+		return nil, fmt.Errorf("не удалось прочитать директорию %s: %w", relativePath, err)
+	}
+
+	names := make([]string, 0, len(entries))
+	for _, fi := range entries {
+		names = append(names, fi.Name())
+	}
+	if logger.Log != nil {
+		logger.Log.Debug("Содержимое директории",
+			zap.String("path", relativePath),
+			zap.Strings("names", names))
+	}
+	return names, nil
+}
+
+// ==================== Вспомогательные методы ====================
+
+func parentDirFromSMBPath(p string) string {
+	if p == "" {
+		return ""
+	}
+	idx := strings.LastIndexAny(p, "/\\")
+	if idx <= 0 {
+		return ""
+	}
+	return p[:idx]
+}
+
+func (c *CIFSClient) ensureRemoteDirAll(dir string) error {
+	if c.fs == nil {
+		return fmt.Errorf("шара не смонтирована: вызовите Connect() перед ensureRemoteDirAll")
+	}
+	trimmed := strings.Trim(dir, "\\/")
+	if trimmed == "" {
+		return nil
+	}
+	parts := strings.FieldsFunc(trimmed, func(r rune) bool { return r == '/' || r == '\\' })
+	accum := ""
+	for _, part := range parts {
+		if part == "" {
+			continue
+		}
+		if accum == "" {
+			accum = part
+		} else {
+			accum = accum + "\\" + part
+		}
+		if err := c.fs.Mkdir(accum, 0755); err != nil {
+			if fi, statErr := c.fs.Stat(accum); statErr == nil {
+				if fi.IsDir() {
+					continue
+				}
+				return fmt.Errorf("путь %s существует, но это не директория", accum)
+			}
+			return fmt.Errorf("не удалось создать директорию %s: %w", accum, err)
+		}
+	}
+	return nil
 }
 
 // ParseUNCPath парсит UNC путь и возвращает сервер, шару и относительный путь
