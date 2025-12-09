@@ -685,9 +685,21 @@ func ParseUNCPath(uncPath string) (server, share, relPath string, err error) {
 
 	server = parts[0]
 	share = parts[1]
+
+	// Применяем замену имени сервера
+	server = resolveServerName(server)
+
 	if len(parts) >= 3 {
 		relPath = parts[2]
 	}
 
 	return server, share, relPath, nil
+}
+
+// resolveServerName заменяет IP на имя сервера при необходимости
+func resolveServerName(server string) string {
+	if server == "192.168.87.31" {
+		return "crys4"
+	}
+	return server
 }
