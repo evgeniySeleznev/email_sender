@@ -466,16 +466,22 @@ func DecodeBase64(encoded string) ([]byte, error) {
 
 // normalizeReportPath нормализует путь к файлу, применяя специфичные замены
 func normalizeReportPath(path string) string {
-	// Замена IP на имя хоста
-	path = strings.ReplaceAll(path, "192.168.87.31", "sto-s")
+	// Специфичная логика для замены старого пути 192.168.87.31:shares$:esig_docs
+	// Целевой путь: \\192.168.7.120\Applic\Xchange\...
+	if strings.Contains(path, "192.168.87.31") || strings.Contains(path, "sto-s") {
+		// 1. Заменяем хост
+		path = strings.ReplaceAll(path, "192.168.87.31", "192.168.7.120")
+		path = strings.ReplaceAll(path, "sto-s", "192.168.7.120")
 
-	// Замена пути к документам
-	// esig_docs -> Applic\Xchange
-	// Обрабатываем разные варианты разделителей
-	path = strings.ReplaceAll(path, "esig_docs", `Applic\Xchange`)
+		// 2. Заменяем шару и путь
+		// shares$ -> Applic
+		// esig_docs -> Xchange
+		path = strings.ReplaceAll(path, "shares$", "Applic")
+		path = strings.ReplaceAll(path, "esig_docs", "Xchange")
+	}
 
 	// Если путь в формате host:share:path, преобразуем в UNC
-	// Пример: sto-s:shares$:Applic\Xchange\OBN... -> \\sto-s\shares$\Applic\Xchange\OBN...
+	// Пример: 192.168.7.120:Applic:Xchange... -> \\192.168.7.120\Applic\Xchange...
 	if strings.Contains(path, ":") && !strings.HasPrefix(path, `\\`) && !strings.HasPrefix(path, `//`) && !strings.Contains(path, `:\`) {
 		// Это не диск C:\, а скорее всего host:share format
 		parts := strings.SplitN(path, ":", 3)
