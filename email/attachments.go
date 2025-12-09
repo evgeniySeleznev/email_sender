@@ -151,7 +151,8 @@ func (p *AttachmentProcessor) processCrystalReport(ctx context.Context, attach *
 	if logger.Log != nil {
 		logger.Log.Debug("Получена информация об отчете",
 			zap.Int64("taskID", taskID),
-			zap.Int("paramsCount", len(reportParams)))
+			zap.Int("paramsCount", len(reportParams)),
+			zap.Any("receivedParams", reportParams))
 	}
 
 	// Шаг 3: Создаем запрос с параметрами для getReport
@@ -185,6 +186,16 @@ func (p *AttachmentProcessor) processCrystalReport(ctx context.Context, attach *
 				},
 			}
 		}
+	}
+
+	if logger.Log != nil {
+		var paramsToLog []Param
+		if reportWithParams.MainReport != nil {
+			paramsToLog = reportWithParams.MainReport.ReportParams.Params
+		}
+		logger.Log.Debug("Параметры для генерации отчета",
+			zap.Int64("taskID", taskID),
+			zap.Any("sentParams", paramsToLog))
 	}
 
 	// Шаг 4: Генерируем отчет

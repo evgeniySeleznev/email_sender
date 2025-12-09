@@ -47,6 +47,6 @@ test_data/
 *.bak
 *.backup
 
-#Deployment files
 Dockerfile
 docker-compose.yml
+
