@@ -143,10 +143,15 @@ func (p *AttachmentProcessor) processCrystalReport(ctx context.Context, attach *
 		return nil, fmt.Errorf("ошибка получения информации об отчете: %w", err)
 	}
 
+	var reportParams []Param
+	if reportInfo.MainReport != nil {
+		reportParams = reportInfo.MainReport.ReportParams.Params
+	}
+
 	if logger.Log != nil {
 		logger.Log.Debug("Получена информация об отчете",
 			zap.Int64("taskID", taskID),
-			zap.Int("paramsCount", len(reportInfo.Params)))
+			zap.Int("paramsCount", len(reportParams)))
 	}
 
 	// Шаг 3: Создаем запрос с параметрами для getReport
@@ -155,8 +160,8 @@ func (p *AttachmentProcessor) processCrystalReport(ctx context.Context, attach *
 	}
 
 	// Применяем параметры отчета
-	if len(attach.AttachParams) > 0 && len(reportInfo.Params) > 0 {
-		params := make([]Param, 0, len(reportInfo.Params))
+	if len(attach.AttachParams) > 0 && len(reportParams) > 0 {
+		params := make([]Param, 0, len(reportParams))
 
 		// Создаем карту параметров из attach.AttachParams для быстрого поиска
 		paramValues := make(map[string]string)
@@ -165,7 +170,7 @@ func (p *AttachmentProcessor) processCrystalReport(ctx context.Context, attach *
 		}
 
 		// Обновляем параметры из reportInfo значениями из attach.AttachParams
-		for _, infoParam := range reportInfo.Params {
+		for _, infoParam := range reportParams {
 			param := infoParam
 			if value, ok := paramValues[infoParam.Name]; ok {
 				param.Value = value
@@ -314,7 +319,7 @@ func (p *AttachmentProcessor) processFile(ctx context.Context, attach *Attachmen
 	maxSizeBytes := int64(maxSizeMB) * 1024 * 1024
 
 	if info.Size() > maxSizeBytes {
-		return nil, fmt.Errorf("размер файла %s (%d байт) превышает лимит %d МБ", 
+		return nil, fmt.Errorf("размер файла %s (%d байт) превышает лимит %d МБ",
 			attach.ReportFile, info.Size(), maxSizeMB)
 	}
 
@@ -409,7 +414,7 @@ func (p *AttachmentProcessor) processUNCFile(ctx context.Context, attach *Attach
 	}
 
 	if fileSize > maxSizeBytes {
-		return nil, fmt.Errorf("размер файла %s (%d байт) превышает лимит %d МБ", 
+		return nil, fmt.Errorf("размер файла %s (%d байт) превышает лимит %d МБ",
 			attach.ReportFile, fileSize, maxSizeMB)
 	}
 

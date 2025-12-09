@@ -107,14 +107,16 @@ func NewCrystalReportsClient(baseURL string, timeout time.Duration) *CrystalRepo
 
 // buildSOAPEnvelope создает SOAP конверт
 func (c *CrystalReportsClient) buildSOAPEnvelope(action string, bodyXML string) string {
+	// Используем префикс ns для action, чтобы вложенные элементы (XMLString) были без namespace (unqualified)
+	// Это соответствует поведению C# клиента и требованиям сервера
 	envelope := fmt.Sprintf(`<?xml version="1.0" encoding="utf-8"?>
-<soap:Envelope xmlns:soap="http://schemas.xmlsoap.org/soap/envelope/">
+<soap:Envelope xmlns:soap="http://schemas.xmlsoap.org/soap/envelope/" xmlns:ns="%s">
     <soap:Body>
-        <%s xmlns="%s">
+        <ns:%s>
             <XMLString><![CDATA[%s]]></XMLString>
-        </%s>
+        </ns:%s>
     </soap:Body>
-</soap:Envelope>`, action, c.namespace, bodyXML, action)
+</soap:Envelope>`, c.namespace, action, bodyXML, action)
 
 	return envelope
 }
@@ -301,7 +303,7 @@ func (c *CrystalReportsClient) parseSOAPResponse(soapResponse, action string) (s
 }
 
 // GetReportInfo получает информацию об отчете
-func (c *CrystalReportsClient) GetReportInfo(ctx context.Context, req *ReportRequest) (*ReportInfoResponse, error) {
+func (c *CrystalReportsClient) GetReportInfo(ctx context.Context, req *ReportRequest) (*ReportWithParams, error) {
 	// Сериализуем запрос в XML
 	var buf bytes.Buffer
 	encoder := xml.NewEncoder(&buf)
@@ -354,7 +356,8 @@ func (c *CrystalReportsClient) GetReportInfo(ctx context.Context, req *ReportReq
 	}
 
 	// Парсим XML ответа
-	var reportInfo ReportInfoResponse
+	// Ответ приходит в формате <Report>...</Report>, а не <ReportInfo>
+	var reportInfo ReportWithParams
 	if err := xml.Unmarshal([]byte(resultXML), &reportInfo); err != nil {
 		return nil, fmt.Errorf("ошибка десериализации ответа: %w", err)
 	}
