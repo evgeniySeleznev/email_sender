@@ -8,7 +8,6 @@ email-service
 email-service.exe
 email-service.darwin
 email-service.linux
-email-service.windows
 *.exe
 main
 
