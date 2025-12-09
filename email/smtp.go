@@ -70,22 +70,39 @@ func (c *SMTPClient) SendEmail(ctx context.Context, msg *EmailMessage, testEmail
 		InsecureSkipVerify: false,
 	}
 
-	// Отправляем email с повторной попыткой при таймауте
+	// Отправляем email с повторной попыткой при таймауте и сетевых ошибках
 	var err error
-	for attempt := 0; attempt < 2; attempt++ {
+	const maxAttempts = 3
+	for attempt := 0; attempt < maxAttempts; attempt++ {
 		err = c.sendWithTLS(ctx, addr, auth, tlsConfig, msg, recipientEmails, emailBody)
 		if err == nil {
 			break
 		}
 
-		// Проверяем на таймаут SMTP команды
-		if strings.Contains(strings.ToLower(err.Error()), "smtp command timeout") {
+		// Проверяем на ошибки, при которых стоит повторить попытку
+		errStr := strings.ToLower(err.Error())
+		shouldRetry := false
+		if strings.Contains(errStr, "smtp command timeout") {
+			shouldRetry = true
+		} else if strings.Contains(errStr, "connection reset") {
+			shouldRetry = true
+		} else if strings.Contains(errStr, "eof") {
+			shouldRetry = true
+		} else if strings.Contains(errStr, "broken pipe") {
+			shouldRetry = true
+		} else if strings.Contains(errStr, "temporary failure") {
+			shouldRetry = true
+		}
+
+		if shouldRetry {
 			if logger.Log != nil {
-				logger.Log.Warn("SMTP таймаут, повторная попытка",
+				logger.Log.Warn("Временная ошибка SMTP, повторная попытка",
 					zap.Int64("taskID", msg.TaskID),
-					zap.Int("attempt", attempt+1))
+					zap.Int("attempt", attempt+1),
+					zap.String("error", err.Error()))
 			}
-			// Повторная попытка
+			// Небольшая пауза перед повтором
+			time.Sleep(time.Duration(attempt+1) * time.Second)
 			continue
 		}
 		// Другие ошибки - не повторяем
@@ -270,21 +287,30 @@ func (c *SMTPClient) buildEmailMessage(msg *EmailMessage, recipientEmails []stri
 }
 
 // sendWithTLS отправляет email с поддержкой TLS
+// sendWithTLS отправляет email с поддержкой TLS
 func (c *SMTPClient) sendWithTLS(ctx context.Context, addr string, auth smtp.Auth, tlsConfig *tls.Config, msg *EmailMessage, recipientEmails []string, body string) error {
 	// Создаем канал для результата
 	done := make(chan error, 1)
-
+	
+	// Канал для уведомления горутины об отмене
+	stopChan := make(chan struct{})
+	
 	go func() {
 		var client *smtp.Client
+		var conn net.Conn
 		var err error
 
 		// Порт 465 использует SMTPS (SMTP over SSL) - прямое TLS соединение
 		// Порт 587 использует STARTTLS - сначала обычное соединение, потом переключение на TLS
 		if c.cfg.Port == 465 {
 			// Для порта 465 используем прямое TLS соединение
-			conn, err := tls.DialWithDialer(&net.Dialer{Timeout: 30 * time.Second}, "tcp", addr, tlsConfig)
+			dialer := &net.Dialer{Timeout: 30 * time.Second}
+			conn, err = tls.DialWithDialer(dialer, "tcp", addr, tlsConfig)
 			if err != nil {
-				done <- fmt.Errorf("ошибка подключения к SMTP через TLS (порт 465): %w", err)
+				select {
+				case done <- fmt.Errorf("ошибка подключения к SMTP через TLS (порт 465): %w", err):
+				case <-stopChan:
+				}
 				return
 			}
 			defer conn.Close()
@@ -292,14 +318,32 @@ func (c *SMTPClient) sendWithTLS(ctx context.Context, addr string, auth smtp.Aut
 			// Создаем SMTP клиент поверх TLS соединения
 			client, err = smtp.NewClient(conn, c.cfg.Host)
 			if err != nil {
-				done <- fmt.Errorf("ошибка создания SMTP клиента: %w", err)
+				select {
+				case done <- fmt.Errorf("ошибка создания SMTP клиента: %w", err):
+				case <-stopChan:
+				}
 				return
 			}
 		} else {
 			// Для других портов (587, 25 и т.д.) используем обычное соединение с STARTTLS
-			client, err = smtp.Dial(addr)
+			// Используем net.DialTimeout для контроля таймаута
+			dialer := &net.Dialer{Timeout: 30 * time.Second}
+			conn, err = dialer.Dial("tcp", addr)
 			if err != nil {
-				done <- fmt.Errorf("ошибка подключения к SMTP: %w", err)
+				select {
+				case done <- fmt.Errorf("ошибка подключения к SMTP: %w", err):
+				case <-stopChan:
+				}
+				return
+			}
+			defer conn.Close()
+
+			client, err = smtp.NewClient(conn, c.cfg.Host)
+			if err != nil {
+				select {
+				case done <- fmt.Errorf("ошибка создания SMTP клиента: %w", err):
+				case <-stopChan:
+				}
 				return
 			}
 
@@ -307,13 +351,19 @@ func (c *SMTPClient) sendWithTLS(ctx context.Context, addr string, auth smtp.Aut
 			if ok, _ := client.Extension("STARTTLS"); ok {
 				if err := client.StartTLS(tlsConfig); err != nil {
 					client.Close()
-					done <- fmt.Errorf("ошибка STARTTLS: %w", err)
+					select {
+					case done <- fmt.Errorf("ошибка STARTTLS: %w", err):
+					case <-stopChan:
+					}
 					return
 				}
 			} else if c.cfg.EnableSSL {
 				// Если требуется SSL, но STARTTLS не поддерживается
 				client.Close()
-				done <- fmt.Errorf("сервер не поддерживает STARTTLS, но требуется SSL")
+				select {
+				case done <- fmt.Errorf("сервер не поддерживает STARTTLS, но требуется SSL"):
+				case <-stopChan:
+				}
 				return
 			}
 		}
@@ -323,21 +373,32 @@ func (c *SMTPClient) sendWithTLS(ctx context.Context, addr string, auth smtp.Aut
 		// Аутентификация
 		if auth != nil {
 			if err := client.Auth(auth); err != nil {
-				done <- fmt.Errorf("ошибка аутентификации: %w", err)
+				select {
+				case done <- fmt.Errorf("ошибка аутентификации: %w", err):
+				case <-stopChan:
+				}
 				return
 			}
 		}
 
 		// Устанавливаем отправителя
 		if err := client.Mail(c.cfg.User); err != nil {
-			done <- fmt.Errorf("ошибка установки отправителя: %w", err)
+			select {
+			case done <- fmt.Errorf("ошибка установки отправителя: %w", err):
+			case <-stopChan:
+				return
+			}
 			return
 		}
 
 		// Устанавливаем получателей (To и BCC)
 		for _, recipientEmail := range recipientEmails {
 			if err := client.Rcpt(recipientEmail); err != nil {
-				done <- fmt.Errorf("ошибка установки получателя %s: %w", recipientEmail, err)
+				select {
+				case done <- fmt.Errorf("ошибка установки получателя %s: %w", recipientEmail, err):
+				case <-stopChan:
+					return
+				}
 				return
 			}
 		}
@@ -345,35 +406,56 @@ func (c *SMTPClient) sendWithTLS(ctx context.Context, addr string, auth smtp.Aut
 		// Отправляем данные
 		writer, err := client.Data()
 		if err != nil {
-			done <- fmt.Errorf("ошибка начала передачи данных: %w", err)
+			select {
+			case done <- fmt.Errorf("ошибка начала передачи данных: %w", err):
+			case <-stopChan:
+				return
+			}
 			return
 		}
 
 		// Записываем тело сообщения
 		if _, err := writer.Write([]byte(body)); err != nil {
 			writer.Close()
-			done <- fmt.Errorf("ошибка записи данных: %w", err)
+			select {
+			case done <- fmt.Errorf("ошибка записи данных: %w", err):
+			case <-stopChan:
+				return
+			}
 			return
 		}
 
 		// Закрываем writer
 		if err := writer.Close(); err != nil {
-			done <- fmt.Errorf("ошибка закрытия writer: %w", err)
+			select {
+			case done <- fmt.Errorf("ошибка закрытия writer: %w", err):
+			case <-stopChan:
+				return
+			}
 			return
 		}
 
 		// Отправляем QUIT
 		if err := client.Quit(); err != nil {
-			done <- fmt.Errorf("ошибка QUIT: %w", err)
+			select {
+			case done <- fmt.Errorf("ошибка QUIT: %w", err):
+			case <-stopChan:
+				return
+			}
 			return
 		}
 
-		done <- nil
+		select {
+		case done <- nil:
+		case <-stopChan:
+			return
+		}
 	}()
 
 	// Ждем завершения или отмены контекста
 	select {
 	case <-ctx.Done():
+		close(stopChan) // Уведомляем горутину об отмене
 		return ctx.Err()
 	case err := <-done:
 		return err

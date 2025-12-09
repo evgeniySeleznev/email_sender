@@ -156,16 +156,12 @@ func (s *Service) Run(ctx context.Context, wg *sync.WaitGroup) {
 		if err != nil && !gracefulShutdownInProgress {
 			// Обычная ошибка (не graceful shutdown) - переподключение
 			logger.Log.Error("Ошибка при выборке сообщений", zap.Error(err))
-			logger.Log.Info("Ошибка соединения, переподключение...")
+			logger.Log.Info("Ошибка соединения, ожидание перед повтором...")
 			if !s.sleepWithContext(ctx, 5*time.Second) {
 				return
 			}
-			if err := s.dbConn.Reconnect(); err != nil {
-				logger.Log.Error("Ошибка переподключения", zap.Error(err))
-				if !s.sleepWithContext(ctx, 5*time.Second) {
-					return
-				}
-			}
+			// Мы НЕ вызываем Reconnect здесь, так как он будет вызван в начале следующей итерации
+			// через CheckConnection -> Reconnect
 			continue
 		}
 

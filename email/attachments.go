@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"go.uber.org/zap"
 
@@ -21,6 +22,7 @@ import (
 type AttachmentProcessor struct {
 	dbConn      *db.DBConnection
 	cifsManager *storage.CIFSManager
+	cfg         *settings.Config
 }
 
 // NewAttachmentProcessor создает новый процессор вложений
@@ -32,6 +34,7 @@ func NewAttachmentProcessor(dbConn *db.DBConnection, cfg *settings.Config) *Atta
 	return &AttachmentProcessor{
 		dbConn:      dbConn,
 		cifsManager: cifsManager,
+		cfg:         cfg,
 	}
 }
 
@@ -83,8 +86,12 @@ func (p *AttachmentProcessor) processCrystalReport(ctx context.Context, attach *
 			zap.String("dbInstance", dbInstance))
 	}
 
-	// Создаем SOAP клиент
-	client := NewCrystalReportsClient(url)
+	// Создаем SOAP клиент с таймаутом из конфигурации
+	timeout := 60 * time.Second
+	if p.cfg != nil && p.cfg.Mode.CrystalReportsTimeoutSec > 0 {
+		timeout = time.Duration(p.cfg.Mode.CrystalReportsTimeoutSec) * time.Second
+	}
+	client := NewCrystalReportsClient(url, timeout)
 
 	// Шаг 1: Создаем запрос для getReportInfo
 	reportRequest := &ReportRequest{
@@ -267,6 +274,18 @@ func (p *AttachmentProcessor) processFile(ctx context.Context, attach *Attachmen
 		return nil, fmt.Errorf("указанный путь является директорией: %s", attach.ReportFile)
 	}
 
+	// Проверка размера файла
+	maxSizeMB := 100
+	if p.cfg != nil && p.cfg.Mode.MaxAttachmentSizeMB > 0 {
+		maxSizeMB = p.cfg.Mode.MaxAttachmentSizeMB
+	}
+	maxSizeBytes := int64(maxSizeMB) * 1024 * 1024
+
+	if info.Size() > maxSizeBytes {
+		return nil, fmt.Errorf("размер файла %s (%d байт) превышает лимит %d МБ", 
+			attach.ReportFile, info.Size(), maxSizeMB)
+	}
+
 	// Читаем файл
 	file, err := os.Open(attach.ReportFile)
 	if err != nil {
@@ -343,6 +362,23 @@ func (p *AttachmentProcessor) processUNCFile(ctx context.Context, attach *Attach
 	}
 	if !exists {
 		return nil, fmt.Errorf("файл не найден на шаре: %s", attach.ReportFile)
+	}
+
+	// Проверка размера файла
+	maxSizeMB := 100
+	if p.cfg != nil && p.cfg.Mode.MaxAttachmentSizeMB > 0 {
+		maxSizeMB = p.cfg.Mode.MaxAttachmentSizeMB
+	}
+	maxSizeBytes := int64(maxSizeMB) * 1024 * 1024
+
+	fileSize, err := client.GetFileSize(relPath)
+	if err != nil {
+		return nil, fmt.Errorf("ошибка получения размера файла %s: %w", attach.ReportFile, err)
+	}
+
+	if fileSize > maxSizeBytes {
+		return nil, fmt.Errorf("размер файла %s (%d байт) превышает лимит %d МБ", 
+			attach.ReportFile, fileSize, maxSizeMB)
 	}
 
 	// Читаем файл с шары

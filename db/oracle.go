@@ -98,88 +98,14 @@ func (d *DBConnection) CheckConnection() bool {
 // Reconnect переподключается к базе данных с пересозданием пула соединений
 // Проверяет наличие активных операций перед переподключением
 // Использует безопасную блокировку без гонок
+// Reconnect переподключается к базе данных с пересозданием пула соединений
+// Использует Hot Swap механизм с принудительной подменой
 func (d *DBConnection) Reconnect() error {
-	// Первая проверка: ждем завершения активных операций БЕЗ блокировки
-	// Это позволяет операциям завершиться естественным образом
-	if err := d.waitForActiveOperations(); err != nil {
-		return fmt.Errorf("не удалось дождаться завершения активных операций: %w", err)
-	}
-
-	// Блокируем доступ к пулу для предотвращения новых операций
-	// Используем цикл с проверкой для предотвращения гонок
-	const maxRetries = 3
-	const retryDelay = 50 * time.Millisecond
-
-	// Пытаемся получить блокировку с проверкой активных операций
-	for retry := 0; retry < maxRetries; retry++ {
-		// Проверяем активные операции БЕЗ блокировки (быстрая проверка)
-		activeCount := d.activeOps.Load()
-		if activeCount == 0 {
-			// Нет активных операций - получаем блокировку и переподключаемся
-			break
-		}
-
-		if retry < maxRetries-1 {
-			if logger.Log != nil {
-				logger.Log.Debug("Обнаружены активные операции, ожидание",
-					zap.Int32("activeOps", activeCount),
-					zap.Int("retry", retry+1),
-					zap.Int("maxRetries", maxRetries))
-			}
-			time.Sleep(retryDelay)
-		} else {
-			// Последняя попытка - ждем завершения операций
-			if logger.Log != nil {
-				logger.Log.Debug("Последняя попытка: ожидание завершения активных операций",
-					zap.Int32("activeOps", activeCount))
-			}
-			if err := d.waitForActiveOperations(); err != nil {
-				return fmt.Errorf("не удалось дождаться завершения активных операций: %w", err)
-			}
-			// Финальная проверка
-			activeCount = d.activeOps.Load()
-			if activeCount > 0 && logger.Log != nil {
-				logger.Log.Warn("Переподключение выполняется при наличии активных операций",
-					zap.Int32("activeOps", activeCount))
-			}
-			break
-		}
-	}
-
-	// Получаем блокировку для переподключения
-	// К этому моменту активные операции должны быть завершены
-	d.mu.Lock()
-	defer d.mu.Unlock()
-
-	// Финальная проверка под блокировкой (на случай гонки)
-	finalActiveCount := d.activeOps.Load()
-	if finalActiveCount > 0 && logger.Log != nil {
-		logger.Log.Warn("Обнаружены активные операции под блокировкой, продолжаем переподключение",
-			zap.Int32("activeOps", finalActiveCount))
-	}
-
-	if logger.Log != nil {
-		logger.Log.Info("Начало переподключения к базе данных...")
-	}
-
-	// Закрываем текущий пул соединений
-	if d.db != nil {
-		_ = d.db.Close()
-		d.db = nil
-		if logger.Log != nil {
-			logger.Log.Debug("Текущий пул соединений закрыт")
-		}
-	}
-
-	// Пересоздаем подключение (открываем новый пул)
-	if err := d.openConnectionInternal(); err != nil {
-		return fmt.Errorf("ошибка переподключения: %w", err)
-	}
-
-	if logger.Log != nil {
-		logger.Log.Info("Переподключение к базе данных выполнено успешно. Пул соединений пересоздан")
-	}
-	return nil
+	// Используем Hot Swap с флагом force=true, так как этот метод обычно вызывается
+	// при ошибках соединения, когда нужно восстановить работу как можно скорее.
+	// При этом активные операции (если они есть) не будут прерваны мгновенно,
+	// а завершатся на старом соединении перед его закрытием.
+	return d.HotSwapReconnect(true)
 }
 
 // waitForActiveOperations ждет завершения активных операций перед переподключением
@@ -236,117 +162,7 @@ func (d *DBConnection) GetActiveOperationsCount() int32 {
 	return d.activeOps.Load()
 }
 
-// openConnectionInternal внутренний метод открытия соединения без блокировки
-func (d *DBConnection) openConnectionInternal() error {
-	if logger.Log != nil {
-		logger.Log.Info("openConnectionInternal: начало открытия соединения")
-	}
-	// Получаем параметры подключения из конфигурации
-	// Для совместимости с существующим форматом используем секцию [ORACLE]
-	oracleSec := d.cfg.File.Section("ORACLE")
-	instance := oracleSec.Key("Instance").String()
 
-	// Также проверяем секцию [main] для user/password (как в smsSender)
-	mainSec := d.cfg.File.Section("main")
-	user := mainSec.Key("username").String()
-	password := mainSec.Key("password").String()
-	if password == "" {
-		password = mainSec.Key("passwword").String() // Совместимость с опечаткой
-	}
-	dsn := mainSec.Key("dsn").String()
-
-	// Формируем строку подключения для godror
-	var connString string
-	if user != "" && password != "" && dsn != "" {
-		connString = fmt.Sprintf("%s/%s@%s", user, password, dsn)
-	} else if instance != "" {
-		// Используем только instance (требует настройки переменных окружения или tnsnames.ora)
-		connString = instance
-	} else {
-		return fmt.Errorf("не указаны параметры подключения к БД")
-	}
-
-	db, err := sql.Open("godror", connString)
-	if err != nil {
-		if logger.Log != nil {
-			logger.Log.Error("Ошибка sql.Open", zap.Error(err))
-		}
-		return fmt.Errorf("ошибка sql.Open: %w", err)
-	}
-
-	// Настройки пула
-	db.SetMaxOpenConns(200)
-	db.SetMaxIdleConns(10)
-	db.SetConnMaxLifetime(5 * time.Minute)
-	db.SetConnMaxIdleTime(5 * time.Minute)
-
-	// Проверка соединения с таймаутом
-	// Используем горутину для гарантированного таймаута, т.к. PingContext может зависать
-	// на уровне ОС (DNS, TCP) до того, как контекст сможет отменить операцию
-	if logger.Log != nil {
-		logger.Log.Info("openConnectionInternal: выполнение PingContext с таймаутом",
-			zap.Duration("timeout", connectionTimeout))
-	}
-
-	// Создаем таймер для гарантированного таймаута
-	timeoutTimer := time.NewTimer(connectionTimeout)
-	defer timeoutTimer.Stop()
-
-	// Канал для результата ping
-	pingDone := make(chan error, 1)
-
-	// Запускаем PingContext в горутине
-	// Используем background context, т.к. реальный таймаут контролируется таймером
-	go func() {
-		// Создаем контекст с таймаутом для PingContext (на случай если он все же поддерживает отмену)
-		pingCtx, pingCancel := context.WithTimeout(context.Background(), connectionTimeout+time.Second)
-		defer pingCancel()
-
-		err := db.PingContext(pingCtx)
-		select {
-		case pingDone <- err:
-			// Результат отправлен
-		default:
-			// Канал уже закрыт (таймаут), игнорируем результат
-		}
-	}()
-
-	select {
-	case err := <-pingDone:
-		// Ping завершился (успешно или с ошибкой)
-		if err != nil {
-			_ = db.Close()
-			if logger.Log != nil {
-				logger.Log.Error("openConnectionInternal: ошибка ping", zap.Error(err))
-			}
-			return fmt.Errorf("ошибка ping: %w", err)
-		}
-		if logger.Log != nil {
-			logger.Log.Info("openConnectionInternal: PingContext успешно выполнен")
-		}
-	case <-timeoutTimer.C:
-		// Таймаут истек - принудительно закрываем соединение
-		_ = db.Close()
-		if logger.Log != nil {
-			logger.Log.Error("openConnectionInternal: таймаут PingContext истек",
-				zap.Duration("timeout", connectionTimeout))
-		}
-		// Ждем немного, чтобы горутина могла завершиться (но не блокируемся навсегда)
-		select {
-		case <-pingDone:
-			// Горутина завершилась, игнорируем результат
-		case <-time.After(100 * time.Millisecond):
-			// Не ждем дольше 100мс
-		}
-		return fmt.Errorf("таймаут подключения к БД (%v): операция не завершилась в течение указанного времени", connectionTimeout)
-	}
-	d.db = db
-	d.lastReconnect = time.Now()
-	if logger.Log != nil {
-		logger.Log.Info("Database connection opened (using Oracle Instant Client via godror)")
-	}
-	return nil
-}
 
 // StartPeriodicReconnect запускает горутину для периодического переподключения к БД
 func (d *DBConnection) StartPeriodicReconnect() {
@@ -365,20 +181,56 @@ func (d *DBConnection) StartPeriodicReconnect() {
 		defer d.reconnectTicker.Stop()
 
 		if logger.Log != nil {
-			logger.Log.Info("Запущен механизм периодического переподключения к БД",
+			logger.Log.Info("Запущен механизм периодического переподключения к БД (Hot Swap)",
 				zap.Duration("interval", d.reconnectInterval))
 		}
+
+		postponeCount := 0
+		const maxPostpones = 3
+		const postponeInterval = 5 * time.Minute // 5 минут отсрочки
 
 		for {
 			select {
 			case <-d.reconnectTicker.C:
-				if logger.Log != nil {
-					logger.Log.Info("Периодическое переподключение к БД",
-						zap.Duration("sinceLastReconnect", time.Since(d.lastReconnect)))
-				}
-				if err := d.Reconnect(); err != nil {
+				// Проверяем активные операции
+				activeOps := d.GetActiveOperationsCount()
+
+				// Если есть активные операции и мы еще не превысили лимит откладываний
+				if activeOps > 0 && postponeCount < maxPostpones {
+					postponeCount++
 					if logger.Log != nil {
-						logger.Log.Error("Ошибка периодического переподключения", zap.Error(err))
+						logger.Log.Info("Периодическое переподключение отложено из-за активных операций",
+							zap.Int32("activeOps", activeOps),
+							zap.Int("postponeCount", postponeCount),
+							zap.Duration("postponeInterval", postponeInterval))
+					}
+					// Сбрасываем тикер на интервал отсрочки
+					d.reconnectTicker.Reset(postponeInterval)
+					continue
+				}
+
+				// Если лимит превышен или нет активных операций - выполняем Hot Swap
+				force := postponeCount >= maxPostpones
+				if force {
+					if logger.Log != nil {
+						logger.Log.Warn("Выполняется принудительное переподключение (Hot Swap) после серии откладываний",
+							zap.Int("postponeCount", postponeCount),
+							zap.Int32("activeOps", activeOps))
+					}
+				} else {
+					if logger.Log != nil {
+						logger.Log.Info("Выполняется плановое переподключение (Hot Swap)",
+							zap.Duration("sinceLastReconnect", time.Since(d.lastReconnect)))
+					}
+				}
+
+				// Сбрасываем счетчик и возвращаем нормальный интервал
+				postponeCount = 0
+				d.reconnectTicker.Reset(d.reconnectInterval)
+
+				if err := d.HotSwapReconnect(force); err != nil {
+					if logger.Log != nil {
+						logger.Log.Error("Ошибка Hot Swap переподключения", zap.Error(err))
 					}
 				}
 
@@ -405,11 +257,164 @@ func (d *DBConnection) StopPeriodicReconnect() {
 
 	if d.reconnectTicker != nil {
 		close(d.reconnectStop)
-		d.reconnectTicker.Stop()
+		// Не останавливаем тикер здесь, так как он используется в горутине.
 		d.reconnectTicker = nil
 		d.reconnectWg.Wait()
 		d.reconnectStop = make(chan struct{})
 	}
+}
+
+// HotSwapReconnect выполняет переподключение с созданием нового соединения перед закрытием старого
+func (d *DBConnection) HotSwapReconnect(force bool) error {
+	if logger.Log != nil {
+		logger.Log.Info("Начало Hot Swap переподключения...")
+	}
+
+	// 1. Создаем новое соединение (это может занять время, но не блокирует работу)
+	newDB, err := d.createConnection()
+	if err != nil {
+		return fmt.Errorf("ошибка создания нового соединения для Hot Swap: %w", err)
+	}
+
+	// 2. Подменяем соединение под блокировкой
+	d.mu.Lock()
+	oldDB := d.db
+	d.db = newDB
+	d.lastReconnect = time.Now()
+	d.mu.Unlock()
+
+	if logger.Log != nil {
+		logger.Log.Info("Hot Swap: пул соединений подменен на новый")
+	}
+
+	// 3. Обрабатываем старое соединение
+	if oldDB != nil {
+		if force {
+			// Если принудительно (были активные операции), даем время на завершение
+			// Запускаем в отдельной горутине, чтобы не блокировать текущий поток
+			go func() {
+				// Ждем чуть больше максимального таймаута запроса (QueryTimeout = 30s)
+				// Дадим с запасом 2 минуты
+				drainTimeout := 2 * time.Minute
+				if logger.Log != nil {
+					logger.Log.Info("Hot Swap: старое соединение будет закрыто через паузу (draining)",
+						zap.Duration("timeout", drainTimeout))
+				}
+				time.Sleep(drainTimeout)
+				
+				if err := oldDB.Close(); err != nil {
+					if logger.Log != nil {
+						logger.Log.Error("Ошибка при отложенном закрытии старого соединения", zap.Error(err))
+					}
+				} else {
+					if logger.Log != nil {
+						logger.Log.Info("Hot Swap: старое соединение успешно закрыто после draining")
+					}
+				}
+			}()
+		} else {
+			// Если операций не было, закрываем сразу
+			if err := oldDB.Close(); err != nil {
+				if logger.Log != nil {
+					logger.Log.Error("Ошибка при закрытии старого соединения", zap.Error(err))
+				}
+			} else {
+				if logger.Log != nil {
+					logger.Log.Info("Hot Swap: старое соединение закрыто")
+				}
+			}
+		}
+	}
+
+	return nil
+}
+
+// createConnection создает и настраивает новое подключение к БД
+func (d *DBConnection) createConnection() (*sql.DB, error) {
+	if logger.Log != nil {
+		logger.Log.Info("createConnection: начало создания соединения")
+	}
+	
+	// Получаем параметры подключения из конфигурации
+	oracleSec := d.cfg.File.Section("ORACLE")
+	instance := oracleSec.Key("Instance").String()
+
+	mainSec := d.cfg.File.Section("main")
+	user := mainSec.Key("username").String()
+	password := mainSec.Key("password").String()
+	if password == "" {
+		password = mainSec.Key("passwword").String()
+	}
+	dsn := mainSec.Key("dsn").String()
+
+	var connString string
+	if user != "" && password != "" && dsn != "" {
+		connString = fmt.Sprintf("%s/%s@%s", user, password, dsn)
+	} else if instance != "" {
+		connString = instance
+	} else {
+		return nil, fmt.Errorf("не указаны параметры подключения к БД")
+	}
+
+	db, err := sql.Open("godror", connString)
+	if err != nil {
+		return nil, fmt.Errorf("ошибка sql.Open: %w", err)
+	}
+
+	// Настройки пула
+	db.SetMaxOpenConns(200)
+	db.SetMaxIdleConns(10)
+	db.SetConnMaxLifetime(5 * time.Minute)
+	db.SetConnMaxIdleTime(5 * time.Minute)
+
+	// Проверка соединения с таймаутом
+	if logger.Log != nil {
+		logger.Log.Info("createConnection: выполнение PingContext с таймаутом",
+			zap.Duration("timeout", connectionTimeout))
+	}
+
+	timeoutTimer := time.NewTimer(connectionTimeout)
+	defer timeoutTimer.Stop()
+
+	pingDone := make(chan error, 1)
+
+	go func() {
+		pingCtx, pingCancel := context.WithTimeout(context.Background(), connectionTimeout+time.Second)
+		defer pingCancel()
+
+		err := db.PingContext(pingCtx)
+		select {
+		case pingDone <- err:
+		default:
+		}
+	}()
+
+	select {
+	case err := <-pingDone:
+		if err != nil {
+			_ = db.Close()
+			return nil, fmt.Errorf("ошибка ping: %w", err)
+		}
+	case <-timeoutTimer.C:
+		_ = db.Close()
+		return nil, fmt.Errorf("таймаут подключения к БД (%v)", connectionTimeout)
+	}
+
+	return db, nil
+}
+
+// openConnectionInternal использует createConnection для инициализации
+func (d *DBConnection) openConnectionInternal() error {
+	db, err := d.createConnection()
+	if err != nil {
+		return err
+	}
+	d.db = db
+	d.lastReconnect = time.Now()
+	if logger.Log != nil {
+		logger.Log.Info("Database connection opened (using Oracle Instant Client via godror)")
+	}
+	return nil
 }
 
 // GetConfig возвращает конфигурацию

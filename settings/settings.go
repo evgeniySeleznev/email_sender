@@ -20,10 +20,12 @@ type Config struct {
 
 // OracleConfig представляет конфигурацию Oracle
 type OracleConfig struct {
-	Instance string
-	User     string
-	Password string
-	DSN      string
+	Instance                string
+	User                    string
+	Password                string
+	DSN                     string
+	DBConnectRetryAttempts  int
+	DBConnectRetryIntervalSec int
 }
 
 // SMTPConfig представляет конфигурацию SMTP сервера
@@ -48,6 +50,8 @@ type ModeConfig struct {
 	SendHiddenCopyToSelf        bool
 	IsBodyHTML                  bool
 	MaxErrorCountForAutoRestart int
+	MaxAttachmentSizeMB         int
+	CrystalReportsTimeoutSec    int
 }
 
 // ScheduleConfig представляет расписание отправки
@@ -124,6 +128,10 @@ func (c *Config) loadOracleConfig() error {
 			c.Oracle.Password = mainSec.Key("passwword").String() // Совместимость с опечаткой
 		}
 		c.Oracle.DSN = mainSec.Key("dsn").String()
+		
+		// Параметры повторного подключения при старте
+		c.Oracle.DBConnectRetryAttempts = mainSec.Key("DBConnectRetryAttempts").MustInt(10)
+		c.Oracle.DBConnectRetryIntervalSec = mainSec.Key("DBConnectRetryIntervalSec").MustInt(5)
 	}
 
 	// Также проверяем секцию [ORACLE] для Instance (совместимость с C# версией)
@@ -209,6 +217,10 @@ func (c *Config) loadModeConfig() error {
 	c.Mode.SendHiddenCopyToSelf = sec.Key("SendHiddenCopyToSelf").MustBool(false)
 	c.Mode.IsBodyHTML = sec.Key("IsBodyHTML").MustBool(false)
 	c.Mode.MaxErrorCountForAutoRestart = sec.Key("MaxErrorCountForAutoRestart").MustInt(50)
+	
+	// Новые параметры надежности
+	c.Mode.MaxAttachmentSizeMB = sec.Key("MaxAttachmentSizeMB").MustInt(100)
+	c.Mode.CrystalReportsTimeoutSec = sec.Key("CrystalReportsTimeoutSec").MustInt(60)
 
 	return nil
 }

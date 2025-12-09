@@ -554,6 +554,20 @@ func (c *CIFSClient) FileExists(filePath string) (bool, error) {
 	return true, nil
 }
 
+// GetFileSize возвращает размер файла на шаре
+func (c *CIFSClient) GetFileSize(filePath string) (int64, error) {
+	if c.fs == nil {
+		return 0, fmt.Errorf("шара не смонтирована: вызовите Connect() перед GetFileSize")
+	}
+
+	fi, err := c.fs.Stat(filePath)
+	if err != nil {
+		return 0, fmt.Errorf("ошибка получения информации о файле %s: %w", filePath, err)
+	}
+
+	return fi.Size(), nil
+}
+
 // ReadFileContent читает файл с шары полностью (добавлено для текущего проекта)
 func (c *CIFSClient) ReadFileContent(filePath string) ([]byte, error) {
 	const maxTries = 2

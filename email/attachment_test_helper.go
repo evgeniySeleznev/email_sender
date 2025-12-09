@@ -28,8 +28,8 @@ func (p *AttachmentProcessor) AddTestAttachmentForType3(ctx context.Context, att
 
 	// UNC путь к тестовому файлу
 	// В raw string: \\\\ = \\ (два обратных слэша), \\ = \ (один обратный слэш)
-	// Результат: \\assdocker\build\SMS_Sender\25.7\installDir\tester_instruction.md
-	testFilePath := `\\\\assdocker\\build\\SMS_Sender\\25.7\\installDir\\tester_instruction.md`
+	// Результат: \\192.168.3.79\build\SMS_Sender\25.7\installDir\tester_instruction.md
+	testFilePath := `\\\\192.168.3.79\\build\\SMS_Sender\\25.7\\installDir\\tester_instruction.md`
 
 	if logger.Log != nil {
 		logger.Log.Info("Добавление тестового вложения для типа 3",

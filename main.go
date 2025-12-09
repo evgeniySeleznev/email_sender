@@ -74,8 +74,31 @@ func initializeDatabase(cfg *settings.Config) *db.DBConnection {
 		logger.Log.Fatal("Ошибка создания подключения к БД", zap.Error(err))
 	}
 
-	if err := dbConn.OpenConnection(); err != nil {
-		logger.Log.Fatal("Ошибка открытия соединения", zap.Error(err))
+	maxRetries := cfg.Oracle.DBConnectRetryAttempts
+	if maxRetries <= 0 {
+		maxRetries = 1
+	}
+	retryInterval := time.Duration(cfg.Oracle.DBConnectRetryIntervalSec) * time.Second
+	if retryInterval <= 0 {
+		retryInterval = 5 * time.Second
+	}
+
+	for i := 0; i < maxRetries; i++ {
+		if err := dbConn.OpenConnection(); err != nil {
+			if i == maxRetries-1 {
+				logger.Log.Fatal("Не удалось подключиться к БД после всех попыток",
+					zap.Int("attempts", maxRetries),
+					zap.Error(err))
+			}
+			logger.Log.Warn("Ошибка подключения к БД, повторная попытка...",
+				zap.Int("attempt", i+1),
+				zap.Int("maxRetries", maxRetries),
+				zap.Duration("nextRetryIn", retryInterval),
+				zap.Error(err))
+			time.Sleep(retryInterval)
+			continue
+		}
+		break
 	}
 
 	logger.Log.Info("Успешно подключено к Oracle базе данных")

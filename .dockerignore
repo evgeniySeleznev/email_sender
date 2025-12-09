@@ -1,0 +1,42 @@
+# Git
+.git
+.gitignore
+
+# Логи
+logs/
+*.log
+
+# Временные файлы
+*.tmp
+*.swp
+*.swo
+*~
+
+# IDE
+.vscode/
+.idea/
+*.iml
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Docker
+Dockerfile
+.dockerignore
+docker-compose.yml
+
+# Документация
+*.md
+!README.md
+
+# Тесты
+*_test.go
+test/
+
+# Собранные бинарники
+email-service
+*.exe
+
+# Конфигурация (будет копироваться отдельно)
+settings/settings.ini

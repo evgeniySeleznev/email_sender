@@ -5,6 +5,9 @@ Instance = your_instance
 username = your_username
 password = your_password
 dsn = your_dsn
+# Параметры повторного подключения к БД при старте
+DBConnectRetryAttempts = 10
+DBConnectRetryIntervalSec = 5
 
 [queue]
 queue_name = askaq.aq_ask
@@ -39,6 +42,10 @@ Debug = False
 SendHiddenCopyToSelf = False
 IsBodyHTML = False
 MaxErrorCountForAutoRestart = 50
+# Максимальный размер вложения в МБ (по умолчанию 100)
+MaxAttachmentSizeMB = 100
+# Таймаут для Crystal Reports в секундах (по умолчанию 60)
+CrystalReportsTimeoutSec = 60
 
 [Schedule]
 TimeStart = 08:00

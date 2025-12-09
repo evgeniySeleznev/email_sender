@@ -88,11 +88,14 @@ type CrystalReportsClient struct {
 }
 
 // NewCrystalReportsClient создает новый клиент
-func NewCrystalReportsClient(baseURL string) *CrystalReportsClient {
+func NewCrystalReportsClient(baseURL string, timeout time.Duration) *CrystalReportsClient {
+	if timeout == 0 {
+		timeout = 60 * time.Second
+	}
 	return &CrystalReportsClient{
 		baseURL: strings.TrimSuffix(baseURL, "/"),
 		httpClient: &http.Client{
-			Timeout: 60 * time.Second,
+			Timeout: timeout,
 		},
 		namespace: CrystalReportsNamespace,
 	}

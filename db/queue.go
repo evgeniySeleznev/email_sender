@@ -119,7 +119,8 @@ func (qr *QueueReader) DequeueMany(ctx context.Context, count int) ([]*QueueMess
 			timeout = 0.05
 		}
 
-		msg, err := qr.dequeueOneMessageWithTimeout(ctx, timeout)
+		// Используем opCtx для ограничения общего времени выполнения пакета
+		msg, err := qr.dequeueOneMessageWithTimeout(opCtx, timeout)
 		if err != nil {
 			if ctx.Err() != nil {
 				if logger.Log != nil {
