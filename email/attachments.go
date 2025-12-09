@@ -475,9 +475,9 @@ func normalizeReportPath(path string) string {
 
 		// 2. Заменяем шару и путь
 		// shares$ -> Applic
-		// esig_docs -> Xchange
+		// esig_docs -> Xchange\esig_docs
 		path = strings.ReplaceAll(path, "shares$", "Applic")
-		path = strings.ReplaceAll(path, "esig_docs", "Xchange")
+		path = strings.ReplaceAll(path, "esig_docs", `Xchange\esig_docs`)
 	}
 
 	// Если путь в формате host:share:path, преобразуем в UNC
