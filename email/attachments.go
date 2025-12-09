@@ -298,6 +298,13 @@ func (p *AttachmentProcessor) processFile(ctx context.Context, attach *Attachmen
 			zap.String("file", attach.ReportFile))
 	}
 
+	// Нормализация пути (специфичный фикс для 192.168.87.31)
+	attach.ReportFile = normalizeReportPath(attach.ReportFile)
+	if logger.Log != nil {
+		logger.Log.Debug("Нормализованный путь",
+			zap.String("file", attach.ReportFile))
+	}
+
 	// Проверяем, является ли путь UNC путем (начинается с \\ или //)
 	isUNCPath := strings.HasPrefix(attach.ReportFile, `\\`) || strings.HasPrefix(attach.ReportFile, `//`)
 
@@ -455,4 +462,35 @@ func (p *AttachmentProcessor) processUNCFile(ctx context.Context, attach *Attach
 // DecodeBase64 декодирует Base64 строку
 func DecodeBase64(encoded string) ([]byte, error) {
 	return base64.StdEncoding.DecodeString(encoded)
+}
+
+// normalizeReportPath нормализует путь к файлу, применяя специфичные замены
+func normalizeReportPath(path string) string {
+	// Замена IP на имя хоста
+	path = strings.ReplaceAll(path, "192.168.87.31", "sto-s")
+
+	// Замена пути к документам
+	// esig_docs -> Applic\Xchange
+	// Обрабатываем разные варианты разделителей
+	path = strings.ReplaceAll(path, "esig_docs", `Applic\Xchange`)
+
+	// Если путь в формате host:share:path, преобразуем в UNC
+	// Пример: sto-s:shares$:Applic\Xchange\OBN... -> \\sto-s\shares$\Applic\Xchange\OBN...
+	if strings.Contains(path, ":") && !strings.HasPrefix(path, `\\`) && !strings.HasPrefix(path, `//`) && !strings.Contains(path, `:\`) {
+		// Это не диск C:\, а скорее всего host:share format
+		parts := strings.SplitN(path, ":", 3)
+		if len(parts) >= 2 {
+			// Собираем UNC путь
+			newPath := `\\` + parts[0] + `\` + parts[1]
+			if len(parts) > 2 {
+				newPath += `\` + parts[2]
+			}
+			// Исправляем возможные двойные слэши или смешанные слэши, если они возникли
+			newPath = strings.ReplaceAll(newPath, `\\`, `\`)
+			newPath = `\\` + strings.TrimPrefix(newPath, `\`) // Возвращаем ведущие \\
+			return newPath
+		}
+	}
+
+	return path
 }
