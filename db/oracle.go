@@ -36,6 +36,7 @@ type DBConnection struct {
 	lastReconnect     time.Time
 	reconnectInterval time.Duration // Интервал переподключения (30 минут)
 	activeOps         atomic.Int32  // Счетчик активных операций с БД
+	reconnectPending  atomic.Bool   // Флаг ожидания переподключения
 }
 
 // NewDBConnection создает новое подключение к БД
@@ -148,8 +149,12 @@ func (d *DBConnection) waitForActiveOperations() error {
 }
 
 // BeginOperation отмечает начало операции с БД
-func (d *DBConnection) BeginOperation() {
+func (d *DBConnection) BeginOperation() error {
+	if d.reconnectPending.Load() {
+		return fmt.Errorf("выполняется переподключение к БД")
+	}
 	d.activeOps.Add(1)
+	return nil
 }
 
 // EndOperation отмечает завершение операции с БД
@@ -161,8 +166,6 @@ func (d *DBConnection) EndOperation() {
 func (d *DBConnection) GetActiveOperationsCount() int32 {
 	return d.activeOps.Load()
 }
-
-
 
 // StartPeriodicReconnect запускает горутину для периодического переподключения к БД
 func (d *DBConnection) StartPeriodicReconnect() {
@@ -188,36 +191,56 @@ func (d *DBConnection) StartPeriodicReconnect() {
 		postponeCount := 0
 		const maxPostpones = 3
 		const postponeInterval = 5 * time.Minute // 5 минут отсрочки
+		const waitActiveOpsTimeout = 10 * time.Second
 
 		for {
 			select {
 			case <-d.reconnectTicker.C:
-				// Проверяем активные операции
+				// 1. Сигнализируем о начале переподключения (блокируем новые операции)
+				d.reconnectPending.Store(true)
+
+				// 2. Ждем завершения активных операций (до 10 секунд)
+				waitStart := time.Now()
 				activeOps := d.GetActiveOperationsCount()
 
-				// Если есть активные операции и мы еще не превысили лимит откладываний
-				if activeOps > 0 && postponeCount < maxPostpones {
-					postponeCount++
+				if activeOps > 0 {
 					if logger.Log != nil {
-						logger.Log.Info("Периодическое переподключение отложено из-за активных операций",
-							zap.Int32("activeOps", activeOps),
-							zap.Int("postponeCount", postponeCount),
-							zap.Duration("postponeInterval", postponeInterval))
+						logger.Log.Info("Ожидание завершения активных операций перед переподключением...",
+							zap.Int32("activeOps", activeOps))
 					}
-					// Сбрасываем тикер на интервал отсрочки
-					d.reconnectTicker.Reset(postponeInterval)
-					continue
+
+					// Цикл ожидания
+					for activeOps > 0 && time.Since(waitStart) < waitActiveOpsTimeout {
+						time.Sleep(100 * time.Millisecond)
+						activeOps = d.GetActiveOperationsCount()
+					}
 				}
 
-				// Если лимит превышен или нет активных операций - выполняем Hot Swap
-				force := postponeCount >= maxPostpones
-				if force {
+				// 3. Проверяем результат ожидания
+				if activeOps > 0 {
+					// Если операции все еще есть - отменяем блокировку и откладываем
+					d.reconnectPending.Store(false)
+
+					if postponeCount < maxPostpones {
+						postponeCount++
+						if logger.Log != nil {
+							logger.Log.Info("Периодическое переподключение отложено из-за активных операций",
+								zap.Int32("activeOps", activeOps),
+								zap.Int("postponeCount", postponeCount),
+								zap.Duration("postponeInterval", postponeInterval))
+						}
+						d.reconnectTicker.Reset(postponeInterval)
+						continue
+					}
+
+					// Если лимит откладываний исчерпан - идем на принудительное (Hot Swap)
 					if logger.Log != nil {
 						logger.Log.Warn("Выполняется принудительное переподключение (Hot Swap) после серии откладываний",
 							zap.Int("postponeCount", postponeCount),
 							zap.Int32("activeOps", activeOps))
 					}
 				} else {
+					// Операций нет - можно переподключаться
 					if logger.Log != nil {
 						logger.Log.Info("Выполняется плановое переподключение (Hot Swap)",
 							zap.Duration("sinceLastReconnect", time.Since(d.lastReconnect)))
@@ -228,11 +251,15 @@ func (d *DBConnection) StartPeriodicReconnect() {
 				postponeCount = 0
 				d.reconnectTicker.Reset(d.reconnectInterval)
 
-				if err := d.HotSwapReconnect(force); err != nil {
+				// Выполняем Hot Swap
+				if err := d.HotSwapReconnect(true); err != nil {
 					if logger.Log != nil {
 						logger.Log.Error("Ошибка Hot Swap переподключения", zap.Error(err))
 					}
 				}
+
+				// Снимаем блокировку новых операций (для нового соединения)
+				d.reconnectPending.Store(false)
 
 			case <-d.reconnectStop:
 				if logger.Log != nil {
@@ -301,7 +328,7 @@ func (d *DBConnection) HotSwapReconnect(force bool) error {
 						zap.Duration("timeout", drainTimeout))
 				}
 				time.Sleep(drainTimeout)
-				
+
 				if err := oldDB.Close(); err != nil {
 					if logger.Log != nil {
 						logger.Log.Error("Ошибка при отложенном закрытии старого соединения", zap.Error(err))
@@ -334,7 +361,7 @@ func (d *DBConnection) createConnection() (*sql.DB, error) {
 	if logger.Log != nil {
 		logger.Log.Info("createConnection: начало создания соединения")
 	}
-	
+
 	// Получаем параметры подключения из конфигурации
 	oracleSec := d.cfg.File.Section("ORACLE")
 	instance := oracleSec.Key("Instance").String()
@@ -444,7 +471,10 @@ func (d *DBConnection) WithDBTx(ctx context.Context, fn func(*sql.Tx) error) err
 		d.mu.Unlock()
 		return fmt.Errorf("соединение с БД не открыто")
 	}
-	d.BeginOperation()
+	if err := d.BeginOperation(); err != nil {
+		d.mu.Unlock()
+		return err
+	}
 	db := d.db
 	d.mu.Unlock()
 
