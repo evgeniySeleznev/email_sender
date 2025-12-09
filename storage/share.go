@@ -189,7 +189,7 @@ func (c *CIFSClient) Connect() error {
 
 	// Устанавливаем соединение с сервером
 	addr := net.JoinHostPort(host, c.Port)
-	conn, err := net.Dial("tcp", addr)
+	conn, err := net.DialTimeout("tcp", addr, 10*time.Second)
 	if err != nil {
 		return fmt.Errorf("ошибка подключения к серверу %s: %w", host, err)
 	}
