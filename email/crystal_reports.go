@@ -9,6 +9,10 @@ import (
 	"net/http"
 	"strings"
 	"time"
+
+	"email-service/logger"
+
+	"go.uber.org/zap"
 )
 
 const (
@@ -26,13 +30,13 @@ type ReportRequest struct {
 
 // MainInfo содержит основную информацию об отчете
 type MainInfo struct {
-	XMLName        xml.Name `xml:"Main"`
+	XMLName         xml.Name `xml:"Main"`
 	ApplicationName string   `xml:"Application_Name,attr"`
-	DBInstance     string   `xml:"DB_Instance,attr"`
-	DBPass         string   `xml:"DB_Pass,attr"`
-	DBUser         string   `xml:"DB_User,attr"`
-	ExportFormat   int      `xml:"ExportFormat,attr"`
-	ReportName     string   `xml:"Report_Name,attr"`
+	DBInstance      string   `xml:"DB_Instance,attr"`
+	DBPass          string   `xml:"DB_Pass,attr"`
+	DBUser          string   `xml:"DB_User,attr"`
+	ExportFormat    int      `xml:"ExportFormat,attr"`
+	ReportName      string   `xml:"Report_Name,attr"`
 }
 
 // ReportInfoResponse представляет ответ от getReportInfo
@@ -55,14 +59,14 @@ type Param struct {
 
 // ReportWithParams представляет запрос с параметрами для getReport
 type ReportWithParams struct {
-	XMLName    xml.Name      `xml:"Report"`
-	Main       MainInfo      `xml:"Main"`
-	MainReport *MainReport   `xml:"main_report,omitempty"`
+	XMLName    xml.Name    `xml:"Report"`
+	Main       MainInfo    `xml:"Main"`
+	MainReport *MainReport `xml:"main_report,omitempty"`
 }
 
 // MainReport содержит параметры отчета
 type MainReport struct {
-	XMLName     xml.Name      `xml:"main_report"`
+	XMLName      xml.Name     `xml:"main_report"`
 	ReportParams ReportParams `xml:"report_params"`
 }
 
@@ -131,6 +135,23 @@ func (c *CrystalReportsClient) parseSOAPFault(soapResponse string) (*SOAPFault, 
 func (c *CrystalReportsClient) callSOAP(ctx context.Context, action string, bodyXML string) (string, error) {
 	soapEnvelope := c.buildSOAPEnvelope(action, bodyXML)
 
+	// Логируем SOAP запрос для отладки (только для getReportInfo, чтобы не засорять логи)
+	if logger.Log != nil && action == "getReportInfo" {
+		// Маскируем пароли в логах
+		soapForLog := soapEnvelope
+		// Ищем и маскируем DB_Pass в XML
+		if idx := strings.Index(soapForLog, `DB_Pass="`); idx != -1 {
+			start := idx + len(`DB_Pass="`)
+			if endIdx := strings.Index(soapForLog[start:], `"`); endIdx != -1 {
+				soapForLog = soapForLog[:start] + "***" + soapForLog[start+endIdx:]
+			}
+		}
+		logger.Log.Debug("SOAP запрос",
+			zap.String("action", action),
+			zap.String("url", c.baseURL),
+			zap.String("soapEnvelope", truncateString(soapForLog, 2000)))
+	}
+
 	req, err := http.NewRequestWithContext(ctx, "POST", c.baseURL, bytes.NewBufferString(soapEnvelope))
 	if err != nil {
 		return "", fmt.Errorf("ошибка создания запроса: %w", err)
@@ -153,36 +174,86 @@ func (c *CrystalReportsClient) callSOAP(ctx context.Context, action string, body
 	bodyStr := string(bodyBytes)
 
 	// Проверяем на SOAP Fault (различные варианты написания)
-	if strings.Contains(bodyStr, "soap:Fault") || 
-	   strings.Contains(bodyStr, "<Fault>") || 
-	   strings.Contains(bodyStr, "faultcode") ||
-	   strings.Contains(bodyStr, "faultstring") {
-		fault, err := c.parseSOAPFault(bodyStr)
-		if err == nil && fault.String != "" {
-			return "", fmt.Errorf("SOAP Fault: %s - %s", fault.Code, fault.String)
+	if strings.Contains(bodyStr, "soap:Fault") ||
+		strings.Contains(bodyStr, "<Fault>") ||
+		strings.Contains(bodyStr, "faultcode") ||
+		strings.Contains(bodyStr, "faultstring") ||
+		strings.Contains(bodyStr, "Fault") {
+		// Логируем полный ответ для диагностики
+		if logger.Log != nil {
+			logger.Log.Error("SOAP Fault обнаружен",
+				zap.String("response", truncateString(bodyStr, 3000)))
 		}
-		// Если не удалось распарсить, но есть Fault, извлекаем вручную
-		if strings.Contains(bodyStr, "faultstring") {
-			// Пытаемся извлечь faultstring напрямую
-			startIdx := strings.Index(bodyStr, "<faultstring>")
-			if startIdx == -1 {
-				startIdx = strings.Index(bodyStr, "faultstring>")
-			}
+
+		// Пытаемся извлечь faultstring различными способами
+		var faultStr string
+
+		// Вариант 1: <faultstring>...</faultstring> или <ns0:faultstring>...</ns0:faultstring>
+		patterns := []string{
+			"<faultstring>",
+			"<ns0:faultstring>",
+			"<ns1:faultstring>",
+			"faultstring>",
+		}
+
+		for _, pattern := range patterns {
+			startIdx := strings.Index(bodyStr, pattern)
 			if startIdx != -1 {
-				startIdx += len("faultstring>")
+				startIdx += len(pattern)
+				// Ищем закрывающий тег
 				endIdx := strings.Index(bodyStr[startIdx:], "<")
 				if endIdx != -1 {
-					faultStr := strings.TrimSpace(bodyStr[startIdx : startIdx+endIdx])
-					return "", fmt.Errorf("SOAP Fault: %s", faultStr)
+					faultStr = strings.TrimSpace(bodyStr[startIdx : startIdx+endIdx])
+					// Убираем возможные префиксы типа ">"
+					faultStr = strings.TrimPrefix(faultStr, ">")
+					faultStr = strings.TrimSpace(faultStr)
+					if faultStr != "" {
+						break
+					}
 				}
 			}
 		}
+
+		// Если не удалось извлечь через теги, пытаемся найти по ключевым словам
+		if faultStr == "" {
+			// Простой поиск по ключевым словам
+			if idx := strings.Index(bodyStr, "NullPointerException"); idx != -1 {
+				// Извлекаем контекст вокруг ошибки
+				start := idx - 50
+				if start < 0 {
+					start = 0
+				}
+				end := idx + 100
+				if end > len(bodyStr) {
+					end = len(bodyStr)
+				}
+				context := bodyStr[start:end]
+				// Извлекаем только саму ошибку
+				if npeIdx := strings.Index(context, "NullPointerException"); npeIdx != -1 {
+					faultStr = strings.TrimSpace(context[npeIdx:])
+					// Обрезаем до первого < или конца строки
+					if endIdx := strings.Index(faultStr, "<"); endIdx != -1 {
+						faultStr = faultStr[:endIdx]
+					}
+					if endIdx := strings.Index(faultStr, "\n"); endIdx != -1 {
+						faultStr = faultStr[:endIdx]
+					}
+				}
+			}
+		}
+
+		if faultStr != "" {
+			return "", fmt.Errorf("SOAP Fault: %s", faultStr)
+		}
+
+		// Если не удалось извлечь, возвращаем общую ошибку
+		return "", fmt.Errorf("SOAP Fault (детали не извлечены, проверьте логи)")
 	}
 
 	if resp.StatusCode != http.StatusOK {
 		// Для HTTP 500 с SOAP Fault уже обработано выше
-		if resp.StatusCode == http.StatusInternalServerError && 
-		   (strings.Contains(bodyStr, "Fault") || strings.Contains(bodyStr, "faultstring")) {
+		if resp.StatusCode == http.StatusInternalServerError &&
+			(strings.Contains(bodyStr, "Fault") || strings.Contains(bodyStr, "faultstring")) {
 			// Пытаемся извлечь информацию об ошибке
 			if strings.Contains(bodyStr, "NullPointerException") {
 				return "", fmt.Errorf("HTTP ошибка 500: NullPointerException на сервере Crystal Reports (возможно, не указаны обязательные параметры DBUser/DBPass)")
@@ -242,6 +313,34 @@ func (c *CrystalReportsClient) GetReportInfo(ctx context.Context, req *ReportReq
 
 	requestXML := buf.String()
 
+	// Валидация обязательных полей перед отправкой
+	if req.Main.ApplicationName == "" {
+		return nil, fmt.Errorf("ApplicationName не может быть пустым")
+	}
+	if req.Main.ReportName == "" {
+		return nil, fmt.Errorf("ReportName не может быть пустым")
+	}
+	if req.Main.DBInstance == "" {
+		return nil, fmt.Errorf("DBInstance не может быть пустым")
+	}
+	if req.Main.DBUser == "" {
+		return nil, fmt.Errorf("DBUser не может быть пустым")
+	}
+	if req.Main.DBPass == "" {
+		return nil, fmt.Errorf("DBPass не может быть пустым")
+	}
+
+	// Логируем XML запрос для отладки (без пароля)
+	if logger.Log != nil {
+		requestXMLForLog := strings.ReplaceAll(requestXML, req.Main.DBPass, "***")
+		logger.Log.Debug("XML запрос getReportInfo",
+			zap.String("xml", requestXMLForLog),
+			zap.String("applicationName", req.Main.ApplicationName),
+			zap.String("reportName", req.Main.ReportName),
+			zap.String("dbInstance", req.Main.DBInstance),
+			zap.String("dbUser", req.Main.DBUser))
+	}
+
 	// Выполняем SOAP запрос
 	soapResponse, err := c.callSOAP(ctx, "getReportInfo", requestXML)
 	if err != nil {
@@ -290,4 +389,3 @@ func (c *CrystalReportsClient) GetReport(ctx context.Context, req *ReportWithPar
 
 	return strings.TrimSpace(base64Data), nil
 }
-
