@@ -152,15 +152,42 @@ func (c *CrystalReportsClient) callSOAP(ctx context.Context, action string, body
 
 	bodyStr := string(bodyBytes)
 
-	// Проверяем на SOAP Fault
-	if strings.Contains(bodyStr, "soap:Fault") || strings.Contains(bodyStr, "<Fault>") {
+	// Проверяем на SOAP Fault (различные варианты написания)
+	if strings.Contains(bodyStr, "soap:Fault") || 
+	   strings.Contains(bodyStr, "<Fault>") || 
+	   strings.Contains(bodyStr, "faultcode") ||
+	   strings.Contains(bodyStr, "faultstring") {
 		fault, err := c.parseSOAPFault(bodyStr)
-		if err == nil {
+		if err == nil && fault.String != "" {
 			return "", fmt.Errorf("SOAP Fault: %s - %s", fault.Code, fault.String)
+		}
+		// Если не удалось распарсить, но есть Fault, извлекаем вручную
+		if strings.Contains(bodyStr, "faultstring") {
+			// Пытаемся извлечь faultstring напрямую
+			startIdx := strings.Index(bodyStr, "<faultstring>")
+			if startIdx == -1 {
+				startIdx = strings.Index(bodyStr, "faultstring>")
+			}
+			if startIdx != -1 {
+				startIdx += len("faultstring>")
+				endIdx := strings.Index(bodyStr[startIdx:], "<")
+				if endIdx != -1 {
+					faultStr := strings.TrimSpace(bodyStr[startIdx : startIdx+endIdx])
+					return "", fmt.Errorf("SOAP Fault: %s", faultStr)
+				}
+			}
 		}
 	}
 
 	if resp.StatusCode != http.StatusOK {
+		// Для HTTP 500 с SOAP Fault уже обработано выше
+		if resp.StatusCode == http.StatusInternalServerError && 
+		   (strings.Contains(bodyStr, "Fault") || strings.Contains(bodyStr, "faultstring")) {
+			// Пытаемся извлечь информацию об ошибке
+			if strings.Contains(bodyStr, "NullPointerException") {
+				return "", fmt.Errorf("HTTP ошибка 500: NullPointerException на сервере Crystal Reports (возможно, не указаны обязательные параметры DBUser/DBPass)")
+			}
+		}
 		return "", fmt.Errorf("HTTP ошибка %d: %s", resp.StatusCode, bodyStr)
 	}
 

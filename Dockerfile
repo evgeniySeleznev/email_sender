@@ -86,9 +86,20 @@ COPY --from=builder /build/settings/settings.ini.example ./settings/settings.ini
 
 # Создаем директории для логов и конфигурации
 RUN mkdir -p logs settings && \
+    chmod 777 /app/logs && \
     chown -R appuser:appuser /app
+
+# Создаем entrypoint скрипт для установки прав при запуске
+RUN echo '#!/bin/bash\n\
+if [ ! -d /app/logs ]; then\n\
+  mkdir -p /app/logs\n\
+fi\n\
+chmod 777 /app/logs 2>/dev/null || true\n\
+exec "$@"' > /app/entrypoint.sh && \
+    chmod +x /app/entrypoint.sh && \
+    chown appuser:appuser /app/entrypoint.sh
 
 USER appuser
 
-# Устанавливаем точку входа
+ENTRYPOINT ["/app/entrypoint.sh"]
 CMD ["./email-service"]

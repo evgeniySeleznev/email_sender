@@ -5,6 +5,14 @@
 -- Проблема: date_delay_send обновлялся в шаге 4, но к моменту отправки в очередь
 -- (шаг 6) уже проходило время, и DELAY становился отрицательным
 -- Решение: обновляем date_delay_send непосредственно перед отправкой в очередь
+--
+-- ВАЖНО ДЛЯ ВЛОЖЕНИЙ ТИПА 1 (Crystal Reports):
+-- Для корректной работы необходимо, чтобы в таблице email_attach были заполнены
+-- поля db_login и db_pass. Если они не заполнены, Go-сервис попытается использовать
+-- значения из конфигурации (Oracle.User/Oracle.Password), но если и там они не указаны,
+-- возникнет ошибка "NullPointerException" на стороне Crystal Reports сервера.
+--
+-- Проверка наличия db_login/db_pass выполняется автоматически после создания вложений.
 -- ============================================================================
 
 DECLARE
@@ -103,6 +111,29 @@ BEGIN
         DBMS_OUTPUT.PUT_LINE('  Проверьте связь в v_com_email_type_attach_type');
     ELSE
         DBMS_OUTPUT.PUT_LINE('  ✓ Создано вложений: ' || v_attach_count);
+        
+        -- Проверяем наличие db_login и db_pass для вложений типа 1
+        DECLARE
+            v_missing_creds_count NUMBER;
+        BEGIN
+            SELECT COUNT(*)
+            INTO v_missing_creds_count
+            FROM pcsystem.email_attach
+            WHERE email_task_id = v_task_id
+              AND report_type = 1
+              AND (db_login IS NULL OR TRIM(db_login) = '' OR db_pass IS NULL OR TRIM(db_pass) = '');
+            
+            IF v_missing_creds_count > 0 THEN
+                DBMS_OUTPUT.PUT_LINE('');
+                DBMS_OUTPUT.PUT_LINE('  ⚠ ВНИМАНИЕ: Найдено ' || v_missing_creds_count || ' вложений без db_login или db_pass!');
+                DBMS_OUTPUT.PUT_LINE('  Go-сервис будет использовать значения из конфигурации (Oracle.User/Oracle.Password)');
+                DBMS_OUTPUT.PUT_LINE('  Если эти значения не указаны в конфигурации, возникнет ошибка при обработке.');
+                DBMS_OUTPUT.PUT_LINE('  Рекомендуется заполнить db_login и db_pass в таблице email_attach:');
+                DBMS_OUTPUT.PUT_LINE('    UPDATE pcsystem.email_attach');
+                DBMS_OUTPUT.PUT_LINE('    SET db_login = ''ваш_логин'', db_pass = ''ваш_пароль''');
+                DBMS_OUTPUT.PUT_LINE('    WHERE email_task_id = ' || v_task_id || ' AND report_type = 1;');
+            END IF;
+        END;
     END IF;
     
     -- ========== ШАГ 3: Создание параметров для вложений ==========
@@ -157,6 +188,7 @@ BEGIN
                 ea.email_attach_file,
                 ea.email_attach_name,
                 ea.db_login,
+                ea.db_pass,
                 ea.report_type
             FROM pcsystem.email_attach ea
             WHERE ea.email_task_id = v_task_id
@@ -168,7 +200,8 @@ BEGIN
             DBMS_OUTPUT.PUT_LINE('      Каталог (ApplicationName): ' || rec.email_attach_catalog);
             DBMS_OUTPUT.PUT_LINE('      Файл (ReportName): ' || rec.email_attach_file);
             DBMS_OUTPUT.PUT_LINE('      Имя для получателя: ' || rec.email_attach_name);
-            DBMS_OUTPUT.PUT_LINE('      DB Login: ' || rec.db_login);
+            DBMS_OUTPUT.PUT_LINE('      DB Login: ' || NVL(rec.db_login, '(НЕ УКАЗАН - будет использовано из конфигурации)'));
+            DBMS_OUTPUT.PUT_LINE('      DB Pass: ' || CASE WHEN rec.db_pass IS NULL OR TRIM(rec.db_pass) = '' THEN '(НЕ УКАЗАН - будет использовано из конфигурации)' ELSE '***' END);
             
             -- Параметры вложения
             DECLARE

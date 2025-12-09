@@ -77,13 +77,45 @@ func (p *AttachmentProcessor) processCrystalReport(ctx context.Context, attach *
 		return nil, fmt.Errorf("не указан DBInstance в конфигурации")
 	}
 
+	// Валидация и установка DBUser и DBPass
+	// Если не указаны в XML, используем значения из конфигурации
+	dbUser := strings.TrimSpace(attach.DbLogin)
+	dbPass := strings.TrimSpace(attach.DbPass)
+
+	if dbUser == "" {
+		// Используем значение из конфигурации как fallback
+		dbUser = strings.TrimSpace(cfg.Oracle.User)
+		if dbUser == "" {
+			return nil, fmt.Errorf("не указан db_login для Crystal Reports вложения и отсутствует значение по умолчанию в конфигурации (Oracle.User)")
+		}
+		if logger.Log != nil {
+			logger.Log.Warn("db_login не указан в XML, используется значение из конфигурации",
+				zap.Int64("taskID", taskID),
+				zap.String("dbUser", dbUser))
+		}
+	}
+
+	if dbPass == "" {
+		// Используем значение из конфигурации как fallback
+		dbPass = strings.TrimSpace(cfg.Oracle.Password)
+		if dbPass == "" {
+			return nil, fmt.Errorf("не указан db_pass для Crystal Reports вложения и отсутствует значение по умолчанию в конфигурации (Oracle.Password)")
+		}
+		if logger.Log != nil {
+			logger.Log.Warn("db_pass не указан в XML, используется значение из конфигурации",
+				zap.Int64("taskID", taskID))
+		}
+	}
+
 	if logger.Log != nil {
 		logger.Log.Debug("Обработка Crystal Reports вложения",
 			zap.Int64("taskID", taskID),
 			zap.String("catalog", attach.Catalog),
 			zap.String("file", attach.File),
 			zap.String("url", url),
-			zap.String("dbInstance", dbInstance))
+			zap.String("dbInstance", dbInstance),
+			zap.String("dbUser", dbUser),
+			zap.Bool("dbPassProvided", attach.DbPass != ""))
 	}
 
 	// Создаем SOAP клиент с таймаутом из конфигурации
@@ -98,8 +130,8 @@ func (p *AttachmentProcessor) processCrystalReport(ctx context.Context, attach *
 		Main: MainInfo{
 			ApplicationName: attach.Catalog,
 			DBInstance:      dbInstance,
-			DBPass:          attach.DbPass,
-			DBUser:          attach.DbLogin,
+			DBPass:          dbPass,
+			DBUser:          dbUser,
 			ExportFormat:    ExportFormatPDF,
 			ReportName:      attach.File,
 		},
