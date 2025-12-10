@@ -1,7 +1,7 @@
 # Чувствительные конфигурационные файлы
-# ettings/settings.ini
-# *.ini
-# config.ini
+settings/settings.ini
+*.ini
+config.ini
 
 # Скомпилированные бинарники
 email-service

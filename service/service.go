@@ -144,7 +144,7 @@ func (s *Service) Run(ctx context.Context, wg *sync.WaitGroup) {
 		}
 
 		// Соединение установлено - пытаемся прочитать сообщения
-			messages, err = s.queueReader.DequeueMany(ctx, 100) // Читаем до 100 сообщений как в smsSender
+		messages, err = s.queueReader.DequeueMany(ctx, 100) // Читаем до 100 сообщений как в smsSender
 
 		// Отправляем сигнал в горутину о получении ответа (независимо от результата)
 		close(iterationSignalChan)
