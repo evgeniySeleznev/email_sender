@@ -1,7 +1,7 @@
 # Чувствительные конфигурационные файлы
-# settings/settings.ini
-# *.ini
-# config.ini
+settings/settings.ini
+*.ini
+config.ini
 
 # Скомпилированные бинарники
 email-service
@@ -13,7 +13,7 @@ main
 
 # Логи и планы
 logs/
-# /md
+/md
 *.log
 *.log.*
 
