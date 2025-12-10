@@ -491,11 +491,36 @@ func normalizeReportPath(path string) string {
 			if len(parts) > 2 {
 				newPath += `\` + parts[2]
 			}
-			// Исправляем возможные двойные слэши или смешанные слэши, если они возникли
-			newPath = strings.ReplaceAll(newPath, `\\`, `\`)
-			newPath = `\\` + strings.TrimPrefix(newPath, `\`) // Возвращаем ведущие \\
+			// Нормализуем слэши: заменяем все обратные слэши на прямые, затем обратно на обратные для UNC
+			// Это гарантирует корректную обработку путей в любом формате
+			newPath = strings.ReplaceAll(newPath, `/`, `\`)
+			// Убираем двойные слэши, кроме ведущих \\
+			for strings.Contains(newPath, `\\`) && !strings.HasPrefix(newPath, `\\`) {
+				newPath = strings.ReplaceAll(newPath, `\\`, `\`)
+			}
+			// Убеждаемся, что путь начинается с \\
+			if !strings.HasPrefix(newPath, `\\`) {
+				newPath = `\\` + strings.TrimPrefix(newPath, `\`)
+			}
 			return newPath
 		}
+	}
+
+	// Нормализуем существующие UNC пути: заменяем прямые слэши на обратные
+	if strings.HasPrefix(path, `\\`) || strings.HasPrefix(path, `//`) {
+		// Сохраняем ведущие слэши
+		prefix := `\\`
+		if strings.HasPrefix(path, `//`) {
+			prefix = `\\`
+			path = `\\` + strings.TrimPrefix(path, `//`)
+		}
+		// Заменяем все прямые слэши на обратные
+		path = strings.ReplaceAll(path, `/`, `\`)
+		// Убираем двойные слэши, кроме ведущих
+		for strings.Contains(path[2:], `\\`) {
+			path = prefix + strings.ReplaceAll(path[2:], `\\`, `\`)
+		}
+		return path
 	}
 
 	return path

@@ -130,87 +130,159 @@ func (c *IMAPClient) CheckEmailStatus(ctx context.Context, messageID string) (in
 }
 
 // checkBounceMessages проверяет наличие bounce messages в указанной папке
-// Ищет письма о недоставке, которые ссылаются на указанный Message-ID
-// Таймаут: 15 секунд на папку
+// Использует SEARCH для поиска bounce-сообщений на сервере, затем FETCH только для найденных
+// Таймаут: 30 секунд на папку
 func (c *IMAPClient) checkBounceMessages(ctx context.Context, imapClient *client.Client, folderName, messageID string) (int, string, error) {
 	// Пробуем выбрать папку
-	_, err := imapClient.Select(folderName, false)
+	mbox, err := imapClient.Select(folderName, false)
 	if err != nil {
 		// Если папка недоступна, возвращаем что не найдено
 		return 0, "", err
 	}
 
-	messageIDClean := strings.Trim(messageID, "<>")
-
-	// Получаем статус папки
-	mailboxStatus, err := imapClient.Status(folderName, []imap.StatusItem{imap.StatusMessages})
-	if err != nil {
-		return 0, "", err
-	}
-
-	if mailboxStatus.Messages == 0 {
+	if mbox.Messages == 0 {
 		return 0, "", nil
 	}
 
-	// Проверяем последние 200 писем (bounce messages обычно приходят быстро)
-	maxMessages := uint32(200)
-	if mailboxStatus.Messages < maxMessages {
-		maxMessages = mailboxStatus.Messages
+	messageIDClean := strings.Trim(messageID, "<>")
+
+	// Таймаут для всей операции проверки папки: 30 секунд
+	searchCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	defer cancel()
+
+	// Используем SEARCH для поиска bounce messages от mailer-daemon
+	// Это намного быстрее, чем FETCH всех писем
+	criteria := imap.NewSearchCriteria()
+	criteria.Header.Add("From", "mailer-daemon")
+
+	// Ограничиваем поиск последними письмами (за последние 7 дней)
+	weekAgo := time.Now().AddDate(0, 0, -7)
+	criteria.Since = weekAgo
+
+	if logger.Log != nil {
+		logger.Log.Debug("IMAP SEARCH bounce messages",
+			zap.String("folder", folderName),
+			zap.String("criteria", "FROM mailer-daemon, SINCE 7 days ago"))
 	}
 
-	seqSet := new(imap.SeqSet)
-	seqSet.AddRange(mailboxStatus.Messages-maxMessages+1, mailboxStatus.Messages)
+	// Выполняем SEARCH
+	searchDone := make(chan error, 1)
+	var uids []uint32
 
-	// Получаем заголовки и тело письма
+	go func() {
+		var searchErr error
+		uids, searchErr = imapClient.Search(criteria)
+		searchDone <- searchErr
+	}()
+
+	select {
+	case <-searchCtx.Done():
+		if logger.Log != nil {
+			logger.Log.Debug("Таймаут SEARCH папки IMAP",
+				zap.String("folder", folderName))
+		}
+		return 0, "", context.DeadlineExceeded
+	case err := <-searchDone:
+		if err != nil {
+			if logger.Log != nil {
+				logger.Log.Debug("Ошибка SEARCH IMAP",
+					zap.String("folder", folderName),
+					zap.Error(err))
+			}
+			return 0, "", err
+		}
+	}
+
+	if len(uids) == 0 {
+		// Bounce messages не найдено
+		return 0, "", nil
+	}
+
+	if logger.Log != nil {
+		logger.Log.Debug("IMAP SEARCH нашёл bounce messages",
+			zap.String("folder", folderName),
+			zap.Int("count", len(uids)))
+	}
+
+	// Ограничиваем количество проверяемых писем (последние 20 bounce)
+	if len(uids) > 20 {
+		uids = uids[len(uids)-20:]
+	}
+
+	// Делаем FETCH только для найденных bounce messages
+	seqSet := new(imap.SeqSet)
+	for _, uid := range uids {
+		seqSet.AddNum(uid)
+	}
+
 	items := []imap.FetchItem{
 		imap.FetchEnvelope,
 		imap.FetchUid,
 	}
 
-	messages := make(chan *imap.Message, 10)
-	done := make(chan error, 1)
+	messages := make(chan *imap.Message, len(uids))
+	fetchDone := make(chan error, 1)
 
 	go func() {
-		done <- imapClient.Fetch(seqSet, items, messages)
+		fetchDone <- imapClient.Fetch(seqSet, items, messages)
 	}()
 
-	// Таймаут для проверки папки: 15 секунд
-	timeout := time.After(15 * time.Second)
+	// Собираем сообщения
+	var fetchedMsgs []*imap.Message
+	fetchTimeout := time.After(15 * time.Second)
 
+fetchLoop:
 	for {
 		select {
-		case <-ctx.Done():
-			return 0, "", ctx.Err()
-		case <-timeout:
-			if logger.Log != nil {
-				logger.Log.Debug("Таймаут проверки папки IMAP",
-					zap.String("folder", folderName),
-					zap.Duration("timeout", 15*time.Second))
-			}
-			// Возвращаем ошибку таймаута, чтобы она была обработана на верхнем уровне
+		case <-searchCtx.Done():
 			return 0, "", context.DeadlineExceeded
-		case err := <-done:
+		case <-fetchTimeout:
+			if logger.Log != nil {
+				logger.Log.Debug("Таймаут FETCH bounce messages",
+					zap.String("folder", folderName))
+			}
+			return 0, "", context.DeadlineExceeded
+		case err := <-fetchDone:
 			if err != nil {
 				return 0, "", err
 			}
-			// Проверка завершена, bounce messages не найдено
-			return 0, "", nil
-
+			break fetchLoop
 		case msg := <-messages:
-			if msg == nil {
-				continue
-			}
-
-			// Проверяем, является ли это bounce message
-			if c.isBounceMessage(msg, messageIDClean) {
-				// Получаем полное тело письма для извлечения деталей ошибки и проверки Message-ID
-				errorDesc, found := c.extractBounceError(ctx, msg, imapClient, folderName, messageIDClean)
-				if found {
-					return 3, errorDesc, nil
-				}
+			if msg != nil {
+				fetchedMsgs = append(fetchedMsgs, msg)
 			}
 		}
 	}
+
+	// Проверяем каждое bounce сообщение на наличие нашего Message-ID
+	for _, msg := range fetchedMsgs {
+		if msg.Envelope == nil {
+			continue
+		}
+
+		// Проверяем InReplyTo заголовок
+		if msg.Envelope.InReplyTo != "" {
+			inReplyToClean := strings.Trim(msg.Envelope.InReplyTo, "<>")
+			if strings.Contains(inReplyToClean, messageIDClean) || strings.Contains(messageIDClean, inReplyToClean) {
+				// Найден bounce для нашего письма!
+				errorDesc, found := c.extractBounceError(searchCtx, msg, imapClient, folderName, messageIDClean)
+				if found {
+					return 3, errorDesc, nil
+				}
+				// Даже если не удалось извлечь детали, это наш bounce
+				return 3, fmt.Sprintf("Bounce message найден в папке '%s' (InReplyTo match)", folderName), nil
+			}
+		}
+
+		// Если InReplyTo не совпал, проверяем тело письма
+		errorDesc, found := c.extractBounceError(searchCtx, msg, imapClient, folderName, messageIDClean)
+		if found {
+			return 3, errorDesc, nil
+		}
+	}
+
+	// Bounce messages найдены, но не для нашего письма
+	return 0, "", nil
 }
 
 // isBounceMessage проверяет, является ли письмо bounce message для указанного Message-ID

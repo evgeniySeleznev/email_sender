@@ -287,7 +287,6 @@ func (c *SMTPClient) buildEmailMessage(msg *EmailMessage, recipientEmails []stri
 }
 
 // sendWithTLS отправляет email с поддержкой TLS
-// sendWithTLS отправляет email с поддержкой TLS
 func (c *SMTPClient) sendWithTLS(ctx context.Context, addr string, auth smtp.Auth, tlsConfig *tls.Config, msg *EmailMessage, recipientEmails []string, body string) error {
 	// Создаем канал для результата
 	done := make(chan error, 1)

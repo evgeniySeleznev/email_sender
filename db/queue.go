@@ -25,11 +25,12 @@ type QueueMessage struct {
 
 // QueueReader инкапсулирует работу с очередью Oracle AQ
 type QueueReader struct {
-	dbConn       *DBConnection
-	queueName    string
-	consumerName string
-	waitTimeout  int // в секундах
-	mu           sync.Mutex
+	dbConn         *DBConnection
+	queueName      string
+	consumerName   string
+	waitTimeout    int // в секундах
+	mu             sync.Mutex
+	packageCreated bool // Флаг, указывающий, что пакет уже создан
 }
 
 // NewQueueReader создает новый экземпляр QueueReader
@@ -88,9 +89,12 @@ func (qr *QueueReader) DequeueMany(ctx context.Context, count int) ([]*QueueMess
 	opCtx, cancel := context.WithTimeout(ctx, ExecTimeout)
 	defer cancel()
 
-	// Создаем пакет один раз перед извлечением всех сообщений
-	if err := qr.ensurePackageExists(opCtx); err != nil {
-		return nil, fmt.Errorf("ошибка создания пакета: %w", err)
+	// Создаем пакет один раз перед извлечением всех сообщений (если еще не создан)
+	if !qr.packageCreated {
+		if err := qr.ensurePackageExists(opCtx); err != nil {
+			return nil, fmt.Errorf("ошибка создания пакета: %w", err)
+		}
+		qr.packageCreated = true
 	}
 
 	var messages []*QueueMessage

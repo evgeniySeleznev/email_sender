@@ -27,9 +27,10 @@ type Service struct {
 	queueReader  *db.QueueReader
 	emailService *email.Service
 
-	// Внутренняя очередь сообщений (requestDir)
-	requestDir   map[string]*db.QueueMessage // Ключ - taskID (string)
-	requestDirMu sync.RWMutex
+	// Внутренняя очередь сообщений (requestDir) - FIFO очередь
+	requestDir    []*db.QueueMessage // Слайс для сохранения порядка (FIFO)
+	requestDirMap map[string]bool    // Мапа для быстрого поиска дубликатов (ключ - taskID)
+	requestDirMu  sync.RWMutex
 
 	// Очередь результатов (responseQueue)
 	responseQueue   chan db.SaveEmailResponseParams
@@ -55,15 +56,12 @@ func NewService(cfg *settings.Config, dbConn *db.DBConnection, queueReader *db.Q
 		dbConn:      dbConn,
 		queueReader: queueReader,
 
-		requestDir:     make(map[string]*db.QueueMessage),
+		requestDir:     make([]*db.QueueMessage, 0),
+		requestDirMap:  make(map[string]bool),
 		responseQueue:  make(chan db.SaveEmailResponseParams, 10000), // Буферизованный канал
 		sendEmailMap:   make(map[string]time.Time),
 		nextDequeueAll: time.Now(), // Сразу при запуске
 	}
-
-	// Запускаем горутину для записи результатов в БД
-	s.responseQueueWg.Add(1)
-	go s.responseQueueWriter(context.Background())
 
 	return s
 }
@@ -75,6 +73,10 @@ func (s *Service) Run(ctx context.Context, wg *sync.WaitGroup) {
 	// Отмечаем начало работы горутины
 	wg.Add(1)
 	defer wg.Done()
+
+	// Запускаем горутину для записи результатов в БД с контекстом для graceful shutdown
+	s.responseQueueWg.Add(1)
+	go s.responseQueueWriter(ctx)
 
 	// Сбрасываем счетчик критических ошибок
 	s.criticalErrorCount.Store(0)
@@ -255,15 +257,18 @@ func (s *Service) enqueueRequest(msg *db.QueueMessage) {
 	s.requestDirMu.Lock()
 	defer s.requestDirMu.Unlock()
 
-	// Проверяем на дубликаты
-	if _, exists := s.requestDir[taskIDStr]; exists {
+	// Проверяем на дубликаты через мапу (быстрый поиск O(1))
+	if s.requestDirMap[taskIDStr] {
 		logger.Log.Error("Новое сообщение в очереди. Уже есть в очереди на отправку",
 			zap.String("taskID", taskIDStr),
 			zap.Int("queueSize", len(s.requestDir)))
 		return
 	}
 
-	s.requestDir[taskIDStr] = msg
+	// Добавляем в конец слайса (FIFO)
+	s.requestDir = append(s.requestDir, msg)
+	// Добавляем в мапу для быстрого поиска дубликатов
+	s.requestDirMap[taskIDStr] = true
 	logger.Log.Info("Новое сообщение в очереди",
 		zap.String("taskID", taskIDStr),
 		zap.Int("queueSize", len(s.requestDir)))
@@ -290,7 +295,7 @@ func (s *Service) processRequestQueue(ctx context.Context) {
 	}
 }
 
-// dequeueRequest извлекает одно сообщение из внутренней очереди
+// dequeueRequest извлекает одно сообщение из внутренней очереди (FIFO)
 func (s *Service) dequeueRequest() *db.QueueMessage {
 	s.requestDirMu.Lock()
 	defer s.requestDirMu.Unlock()
@@ -299,13 +304,22 @@ func (s *Service) dequeueRequest() *db.QueueMessage {
 		return nil
 	}
 
-	// Берем первое сообщение (FIFO)
-	for taskID, msg := range s.requestDir {
-		delete(s.requestDir, taskID)
-		return msg
+	// Берем первое сообщение из слайса (FIFO)
+	msg := s.requestDir[0]
+
+	// Удаляем taskID из мапы для быстрого поиска дубликатов
+	// Парсим taskID из сообщения
+	parsed, err := s.queueReader.ParseXMLMessage(msg)
+	if err == nil {
+		if taskIDStr, ok := parsed["email_task_id"].(string); ok {
+			taskIDStr = strings.TrimSpace(taskIDStr)
+			delete(s.requestDirMap, taskIDStr)
+		}
 	}
 
-	return nil
+	// Удаляем первый элемент, сдвигая слайс
+	s.requestDir = s.requestDir[1:]
+	return msg
 }
 
 // sendMessage отправляет одно сообщение
