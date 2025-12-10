@@ -25,7 +25,7 @@ type SentEmailInfo struct {
 // errorText - текст ошибки для записи в error_text (может быть пустым)
 type StatusUpdateCallback func(taskID int64, status int, statusDesc string, errorText string)
 
-// StatusChecker отвечает за проверку статуса отправленных писем через IMAP/POP3
+// StatusChecker отвечает за проверку статуса отправленных писем через IMAP
 type StatusChecker struct {
 	cfg                  *settings.Config
 	statusCheckChan      chan *SentEmailInfo

@@ -132,6 +132,7 @@ func (m *CIFSManager) Close() {
 }
 
 // CleanupIdleConnections очищает неиспользуемые подключения
+// NOTE: Функция оставлена для возможного использования в production для периодической очистки неактивных соединений
 func (m *CIFSManager) CleanupIdleConnections(maxIdleTime time.Duration) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -448,82 +449,6 @@ func (c *CIFSClient) FindFileBySuffix(dirPath, suffix string) (string, bool, err
 	return "", false, nil
 }
 
-var writeSema = make(chan struct{}, 50)
-
-// WriteStream записывает данные из io.Reader на шару
-func (c *CIFSClient) WriteStream(destPath string, src io.Reader) (int64, error) {
-	const maxTries = 2
-	for attempt := 0; attempt < maxTries; attempt++ {
-		written, err := c.writeStreamOnce(destPath, src)
-		if err != nil {
-			if attempt == 0 {
-				if logger.Log != nil {
-					logger.Log.Warn("WriteStream: ошибка ввода-вывода, пробуем восстановить соединение")
-				}
-				if _, rerr := c.readyFS(); rerr != nil {
-					return 0, rerr
-				}
-				continue
-			}
-			return 0, err
-		}
-		return written, nil
-	}
-	return 0, nil
-}
-
-// writeStreamOnce потоковая запись из io.Reader
-func (c *CIFSClient) writeStreamOnce(destPath string, src io.Reader) (int64, error) {
-	writeSema <- struct{}{}
-	defer func() { <-writeSema }()
-
-	if c.fs == nil {
-		return 0, fmt.Errorf("шара не смонтирована: вызовите Connect() перед WriteStream")
-	}
-
-	dir := parentDirFromSMBPath(destPath)
-	if err := c.ensureRemoteDirAll(dir); err != nil {
-		return 0, err
-	}
-
-	cleanPath := strings.ReplaceAll(destPath, `\`, `/`)
-	remoteDir := path.Dir(cleanPath)
-	fileName := path.Base(cleanPath)
-
-	suffix := fileName
-	if idx := strings.LastIndex(fileName, "_"); idx != -1 {
-		suffix = fileName[idx+1:]
-	}
-
-	if logger.Log != nil {
-		logger.Log.Info("Запись файла на шару",
-			zap.String("remoteDir", remoteDir))
-	}
-	if existing, found, err := c.FindFileBySuffix(remoteDir, suffix); err != nil {
-		return 0, fmt.Errorf("ошибка поиска существующего файла: %w", err)
-	} else if found {
-		if logger.Log != nil {
-			logger.Log.Warn("Файл уже существует, пропускаем",
-				zap.String("file", existing))
-		}
-		return 0, nil
-	}
-
-	dst, err := c.fs.OpenFile(destPath, os.O_CREATE|os.O_WRONLY, 0644)
-	if err != nil {
-		return 0, fmt.Errorf("не удалось создать файл на шаре %s: %w", destPath, err)
-	}
-	defer dst.Close()
-
-	buf := make([]byte, 32*1024)
-	written, err := io.CopyBuffer(dst, src, buf)
-	if err != nil {
-		return 0, fmt.Errorf("ошибка потоковой записи на шару: %w", err)
-	}
-	time.Sleep(50 * time.Millisecond)
-	return written, nil
-}
-
 func (c *CIFSClient) OpenFile(filePath string) (io.ReadCloser, error) {
 	if c.fs == nil {
 		return nil, fmt.Errorf("шара не смонтирована: вызовите Connect() перед OpenFile")
@@ -600,6 +525,7 @@ func (c *CIFSClient) readFileContentOnce(filePath string) ([]byte, error) {
 }
 
 // ListRoot — выводит и возвращает список элементов в корне смонтированной шары
+// NOTE: Функция оставлена для возможного использования в production для диагностики и отладки подключений к шарам
 func (c *CIFSClient) ListRoot(relativePath string) ([]string, error) {
 	if c.fs == nil {
 		return nil, fmt.Errorf("шара не смонтирована: вызовите Connect() перед ListRoot")
@@ -620,51 +546,6 @@ func (c *CIFSClient) ListRoot(relativePath string) ([]string, error) {
 			zap.Strings("names", names))
 	}
 	return names, nil
-}
-
-// ==================== Вспомогательные методы ====================
-
-func parentDirFromSMBPath(p string) string {
-	if p == "" {
-		return ""
-	}
-	idx := strings.LastIndexAny(p, "/\\")
-	if idx <= 0 {
-		return ""
-	}
-	return p[:idx]
-}
-
-func (c *CIFSClient) ensureRemoteDirAll(dir string) error {
-	if c.fs == nil {
-		return fmt.Errorf("шара не смонтирована: вызовите Connect() перед ensureRemoteDirAll")
-	}
-	trimmed := strings.Trim(dir, "\\/")
-	if trimmed == "" {
-		return nil
-	}
-	parts := strings.FieldsFunc(trimmed, func(r rune) bool { return r == '/' || r == '\\' })
-	accum := ""
-	for _, part := range parts {
-		if part == "" {
-			continue
-		}
-		if accum == "" {
-			accum = part
-		} else {
-			accum = accum + "\\" + part
-		}
-		if err := c.fs.Mkdir(accum, 0755); err != nil {
-			if fi, statErr := c.fs.Stat(accum); statErr == nil {
-				if fi.IsDir() {
-					continue
-				}
-				return fmt.Errorf("путь %s существует, но это не директория", accum)
-			}
-			return fmt.Errorf("не удалось создать директорию %s: %w", accum, err)
-		}
-	}
-	return nil
 }
 
 // ParseUNCPath парсит UNC путь и возвращает сервер, шару и относительный путь

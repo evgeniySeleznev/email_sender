@@ -57,7 +57,6 @@ func NewService(cfg *settings.Config, dbConn *db.DBConnection, statusCallback St
 // Close закрывает сервис
 func (s *Service) Close() error {
 	// SMTP клиенты не требуют явного закрытия (используют стандартный net/smtp)
-	// POP3 клиенты создаются по требованию и закрываются автоматически
 	if logger.Log != nil {
 		logger.Log.Info("Email сервис закрыт")
 	}
@@ -164,12 +163,6 @@ func (s *Service) getTestEmail(ctx context.Context) string {
 // ProcessAttachment обрабатывает вложение и возвращает данные для отправки
 func (s *Service) ProcessAttachment(ctx context.Context, attach *Attachment, taskID int64) (*AttachmentData, error) {
 	return s.attachmentProcessor.ProcessAttachment(ctx, attach, taskID)
-}
-
-// AddTestAttachmentForType3 добавляет тестовое вложение к письмам типа 3 с ЭЦП
-// ВАЖНО: Этот метод создан для тестирования и должен быть удален после тестов
-func (s *Service) AddTestAttachmentForType3(ctx context.Context, attachments []AttachmentData, hasType3 bool) ([]AttachmentData, error) {
-	return s.attachmentProcessor.AddTestAttachmentForType3(ctx, attachments, hasType3)
 }
 
 // EmailMessage представляет email сообщение для отправки

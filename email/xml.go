@@ -3,6 +3,7 @@ package email
 import (
 	"encoding/xml"
 	"fmt"
+	"path/filepath"
 	"strconv"
 	"strings"
 )
@@ -172,11 +173,12 @@ func ParseAttachments(xmlPayload string, taskID int64) ([]Attachment, error) {
 
 		case 3:
 			// Тип 3: Готовый файл
+			// Имя файла берём из пути (аналогично C#: Path.GetFileName(ReportFile))
 			if attachElem.ReportFile == "" {
 				return nil, fmt.Errorf("не указан report_file для типа 3")
 			}
 			attach.ReportFile = attachElem.ReportFile
-			attach.FileName = attachElem.EmailAttachName
+			attach.FileName = filepath.Base(attachElem.ReportFile)
 
 		default:
 			// Тип 1: Crystal Reports

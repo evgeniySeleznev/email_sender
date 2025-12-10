@@ -20,11 +20,11 @@ type Config struct {
 
 // OracleConfig представляет конфигурацию Oracle
 type OracleConfig struct {
-	Instance                string
-	User                    string
-	Password                string
-	DSN                     string
-	DBConnectRetryAttempts  int
+	Instance                  string
+	User                      string
+	Password                  string
+	DSN                       string
+	DBConnectRetryAttempts    int
 	DBConnectRetryIntervalSec int
 }
 
@@ -38,9 +38,7 @@ type SMTPConfig struct {
 	EnableSSL                    bool
 	MinSendIntervalMsec          int
 	SMTPMinSendEmailIntervalMsec int
-	POPHost                      string
-	POPPort                      int
-	IMAPHost                     string // IMAP сервер для получения DSN (альтернатива POP3)
+	IMAPHost                     string // IMAP сервер для проверки bounce-сообщений
 	IMAPPort                     int    // IMAP порт (обычно 993 для SSL)
 }
 
@@ -128,7 +126,7 @@ func (c *Config) loadOracleConfig() error {
 			c.Oracle.Password = mainSec.Key("passwword").String() // Совместимость с опечаткой
 		}
 		c.Oracle.DSN = mainSec.Key("dsn").String()
-		
+
 		// Параметры повторного подключения при старте
 		c.Oracle.DBConnectRetryAttempts = mainSec.Key("DBConnectRetryAttempts").MustInt(10)
 		c.Oracle.DBConnectRetryIntervalSec = mainSec.Key("DBConnectRetryIntervalSec").MustInt(5)
@@ -182,9 +180,6 @@ func (c *Config) loadSMTPConfig() error {
 		minSendIntervalMsec := sec.Key("MinSendIntervalMsec").MustInt(1000)
 		minSendEmailIntervalMsec := sec.Key("SMTPMinSendEmailIntervalMsec").MustInt(1000)
 
-		popHost := sec.Key("POPHost").String()
-		popPort := sec.Key("POPPort").MustInt(110)
-
 		imapHost := sec.Key("IMAPHost").String()
 		imapPort := sec.Key("IMAPPort").MustInt(993) // По умолчанию 993 для SSL
 
@@ -197,8 +192,6 @@ func (c *Config) loadSMTPConfig() error {
 			EnableSSL:                    enableSSL,
 			MinSendIntervalMsec:          minSendIntervalMsec,
 			SMTPMinSendEmailIntervalMsec: minSendEmailIntervalMsec,
-			POPHost:                      popHost,
-			POPPort:                      popPort,
 			IMAPHost:                     imapHost,
 			IMAPPort:                     imapPort,
 		})
@@ -217,7 +210,7 @@ func (c *Config) loadModeConfig() error {
 	c.Mode.SendHiddenCopyToSelf = sec.Key("SendHiddenCopyToSelf").MustBool(false)
 	c.Mode.IsBodyHTML = sec.Key("IsBodyHTML").MustBool(false)
 	c.Mode.MaxErrorCountForAutoRestart = sec.Key("MaxErrorCountForAutoRestart").MustInt(50)
-	
+
 	// Новые параметры надежности
 	c.Mode.MaxAttachmentSizeMB = sec.Key("MaxAttachmentSizeMB").MustInt(100)
 	c.Mode.CrystalReportsTimeoutSec = sec.Key("CrystalReportsTimeoutSec").MustInt(60)
@@ -306,12 +299,4 @@ func (c *Config) loadShareConfig() error {
 	}
 
 	return nil
-}
-
-// GetOracleDSN возвращает строку подключения к Oracle
-func (c *Config) GetOracleDSN() string {
-	// Формируем DSN для godror: user/password@instance
-	// Но user и password должны быть получены из переменных окружения или отдельной секции
-	// Для совместимости с существующим форматом используем Instance напрямую
-	return c.Oracle.Instance
 }

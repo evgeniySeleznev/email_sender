@@ -459,11 +459,6 @@ func (p *AttachmentProcessor) processUNCFile(ctx context.Context, attach *Attach
 	}, nil
 }
 
-// DecodeBase64 декодирует Base64 строку
-func DecodeBase64(encoded string) ([]byte, error) {
-	return base64.StdEncoding.DecodeString(encoded)
-}
-
 // normalizeReportPath нормализует путь к файлу, применяя специфичные замены
 func normalizeReportPath(path string) string {
 	// Специфичная логика для замены старого пути 192.168.87.31:shares$:esig_docs
