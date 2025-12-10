@@ -74,7 +74,7 @@ func (c *SMTPClient) SendEmail(ctx context.Context, msg *EmailMessage, testEmail
 	var err error
 	const maxAttempts = 3
 	for attempt := 0; attempt < maxAttempts; attempt++ {
-		err = c.sendWithTLS(ctx, addr, auth, tlsConfig, msg, recipientEmails, emailBody)
+		err = c.sendWithTLS(ctx, addr, auth, tlsConfig, msg, recipientEmails, emailBody, sendHiddenCopyToSelf)
 		if err == nil {
 			break
 		}
@@ -287,14 +287,13 @@ func (c *SMTPClient) buildEmailMessage(msg *EmailMessage, recipientEmails []stri
 }
 
 // sendWithTLS отправляет email с поддержкой TLS
-// sendWithTLS отправляет email с поддержкой TLS
-func (c *SMTPClient) sendWithTLS(ctx context.Context, addr string, auth smtp.Auth, tlsConfig *tls.Config, msg *EmailMessage, recipientEmails []string, body string) error {
+func (c *SMTPClient) sendWithTLS(ctx context.Context, addr string, auth smtp.Auth, tlsConfig *tls.Config, msg *EmailMessage, recipientEmails []string, body string, sendHiddenCopyToSelf bool) error {
 	// Создаем канал для результата
 	done := make(chan error, 1)
-	
+
 	// Канал для уведомления горутины об отмене
 	stopChan := make(chan struct{})
-	
+
 	go func() {
 		var client *smtp.Client
 		var conn net.Conn
@@ -396,6 +395,18 @@ func (c *SMTPClient) sendWithTLS(ctx context.Context, addr string, auth smtp.Aut
 			if err := client.Rcpt(recipientEmail); err != nil {
 				select {
 				case done <- fmt.Errorf("ошибка установки получателя %s: %w", recipientEmail, err):
+				case <-stopChan:
+					return
+				}
+				return
+			}
+		}
+
+		// Добавляем BCC получателя (скрытая копия отправителю)
+		if sendHiddenCopyToSelf && c.cfg.User != "" {
+			if err := client.Rcpt(c.cfg.User); err != nil {
+				select {
+				case done <- fmt.Errorf("ошибка установки BCC получателя %s: %w", c.cfg.User, err):
 				case <-stopChan:
 					return
 				}
