@@ -495,7 +495,13 @@ func (d *DBConnection) WithDBTx(ctx context.Context, fn func(*sql.Tx) error) err
 	if err != nil {
 		return fmt.Errorf("ошибка начала транзакции: %w", err)
 	}
-	defer tx.Rollback()
+
+	var committed bool
+	defer func() {
+		if !committed {
+			tx.Rollback()
+		}
+	}()
 
 	// Выполняем функцию с транзакцией
 	if err := fn(tx); err != nil {
@@ -506,6 +512,7 @@ func (d *DBConnection) WithDBTx(ctx context.Context, fn func(*sql.Tx) error) err
 	if err := tx.Commit(); err != nil {
 		return fmt.Errorf("ошибка коммита транзакции: %w", err)
 	}
+	committed = true
 
 	return nil
 }

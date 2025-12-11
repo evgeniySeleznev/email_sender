@@ -298,8 +298,8 @@ func (p *AttachmentProcessor) processFile(ctx context.Context, attach *Attachmen
 			zap.String("file", attach.ReportFile))
 	}
 
-	// Нормализация пути (специфичный фикс для 192.168.87.31)
-	attach.ReportFile = normalizeReportPath(attach.ReportFile)
+	// Нормализация пути (замена из конфигурации, если задана)
+	attach.ReportFile = p.normalizeReportPath(attach.ReportFile)
 	if logger.Log != nil {
 		logger.Log.Debug("Нормализованный путь",
 			zap.String("file", attach.ReportFile))
@@ -348,23 +348,21 @@ func (p *AttachmentProcessor) processFile(ctx context.Context, attach *Attachmen
 	}
 	defer file.Close()
 
-	// Читаем данные с контекстом
-	done := make(chan error, 1)
-	var data []byte
+	// Читаем данные синхронно с ограничением размера
+	// Используем LimitReader для защиты от слишком больших файлов
+	maxSize := int64(maxSizeMB * 1024 * 1024)
+	limitedReader := io.LimitReader(file, maxSize+1) // +1 чтобы обнаружить превышение
 
-	go func() {
-		var readErr error
-		data, readErr = io.ReadAll(file)
-		done <- readErr
-	}()
-
+	// Проверяем контекст перед чтением
 	select {
 	case <-ctx.Done():
 		return nil, ctx.Err()
-	case err := <-done:
-		if err != nil {
-			return nil, fmt.Errorf("ошибка чтения файла: %w", err)
-		}
+	default:
+	}
+
+	data, err := io.ReadAll(limitedReader)
+	if err != nil {
+		return nil, fmt.Errorf("ошибка чтения файла: %w", err)
 	}
 
 	// Проверяем, что файл не пустой
@@ -459,20 +457,21 @@ func (p *AttachmentProcessor) processUNCFile(ctx context.Context, attach *Attach
 	}, nil
 }
 
-// normalizeReportPath нормализует путь к файлу, применяя специфичные замены
-func normalizeReportPath(path string) string {
-	// Специфичная логика для замены старого пути 192.168.87.31:shares$:esig_docs
-	// Целевой путь: \\192.168.7.120\Applic\Xchange\...
-	if strings.Contains(path, "192.168.87.31") || strings.Contains(path, "sto-s") {
-		// 1. Заменяем хост
-		path = strings.ReplaceAll(path, "192.168.87.31", "192.168.7.120")
-		path = strings.ReplaceAll(path, "sto-s", "192.168.7.120")
-
-		// 2. Заменяем шару и путь
-		// shares$ -> Applic
-		// esig_docs -> Xchange\EDS
-		path = strings.ReplaceAll(path, "shares$", "Applic")
-		path = strings.ReplaceAll(path, "esig_docs", `Xchange\EDS`)
+// normalizeReportPath нормализует путь к файлу, применяя замены из конфигурации
+func (p *AttachmentProcessor) normalizeReportPath(path string) string {
+	// Применяем замену из конфигурации, если задана
+	if p.cfg != nil && p.cfg.Share.PathReplaceFrom != "" && p.cfg.Share.PathReplaceTo != "" {
+		if strings.Contains(path, p.cfg.Share.PathReplaceFrom) {
+			originalPath := path
+			path = strings.Replace(path, p.cfg.Share.PathReplaceFrom, p.cfg.Share.PathReplaceTo, 1)
+			if logger.Log != nil {
+				logger.Log.Debug("Путь заменён по конфигурации",
+					zap.String("from", originalPath),
+					zap.String("to", path),
+					zap.String("replaceFrom", p.cfg.Share.PathReplaceFrom),
+					zap.String("replaceTo", p.cfg.Share.PathReplaceTo))
+			}
+		}
 	}
 
 	// Если путь в формате host:share:path, преобразуем в UNC
@@ -487,7 +486,6 @@ func normalizeReportPath(path string) string {
 				newPath += `\` + parts[2]
 			}
 			// Нормализуем слэши: заменяем все обратные слэши на прямые, затем обратно на обратные для UNC
-			// Это гарантирует корректную обработку путей в любом формате
 			newPath = strings.ReplaceAll(newPath, `/`, `\`)
 			// Убираем двойные слэши, кроме ведущих \\
 			for strings.Contains(newPath, `\\`) && !strings.HasPrefix(newPath, `\\`) {

@@ -410,6 +410,16 @@ func (s *Service) sendMessage(ctx context.Context, msg *db.QueueMessage) {
 
 	// Обрабатываем вложения
 	attachmentData := make([]email.AttachmentData, 0, len(attachments))
+
+	// Проверяем, что emailService инициализирован
+	if s.emailService == nil {
+		logger.Log.Error("emailService не инициализирован",
+			zap.Int64("taskID", taskID))
+		status = 3 // Failed
+		statusDesc = "emailService не инициализирован"
+		return
+	}
+
 	for i, attach := range attachments {
 		logger.Log.Debug("Обработка вложения",
 			zap.Int64("taskID", emailMsg.TaskID),
@@ -736,8 +746,11 @@ func (s *Service) responseQueueWriter(ctx context.Context) {
 
 // writeResponseBatch записывает батч результатов в БД
 func (s *Service) writeResponseBatch(batch []db.SaveEmailResponseParams) {
+	// Используем контекст с таймаутом для каждой записи
 	for _, params := range batch {
-		success, err := s.dbConn.SaveEmailResponse(context.Background(), params)
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		success, err := s.dbConn.SaveEmailResponse(ctx, params)
+		cancel()
 		if !success {
 			if err != nil {
 				logger.Log.Error("Ошибка сохранения результата email в БД",

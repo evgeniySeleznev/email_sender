@@ -26,7 +26,9 @@ type Service struct {
 	testEmailCacheTTL   time.Duration
 
 	// Проверка статуса отправленных писем (bounce через IMAP)
-	statusChecker *StatusChecker
+	statusChecker       *StatusChecker
+	statusCheckerCtx    context.Context    // Контекст для StatusChecker
+	statusCheckerCancel context.CancelFunc // Функция отмены для graceful shutdown
 }
 
 // NewService создает новый email сервис
@@ -47,15 +49,19 @@ func NewService(cfg *settings.Config, dbConn *db.DBConnection, statusCallback St
 		statusChecker:       NewStatusChecker(cfg, statusCallback),
 	}
 
-	// Запускаем горутину для проверки статусов отправленных писем
-	// Контекст будет передан при вызове Close или через отдельный механизм
-	service.statusChecker.Start(context.Background())
+	// Создаём контекст с возможностью отмены для StatusChecker
+	service.statusCheckerCtx, service.statusCheckerCancel = context.WithCancel(context.Background())
+	service.statusChecker.Start(service.statusCheckerCtx)
 
 	return service, nil
 }
 
 // Close закрывает сервис
 func (s *Service) Close() error {
+	// Отменяем контекст StatusChecker для graceful shutdown
+	if s.statusCheckerCancel != nil {
+		s.statusCheckerCancel()
+	}
 	// SMTP клиенты не требуют явного закрытия (используют стандартный net/smtp)
 	if logger.Log != nil {
 		logger.Log.Info("Email сервис закрыт")

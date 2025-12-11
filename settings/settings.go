@@ -10,12 +10,13 @@ import (
 // Config представляет конфигурацию приложения
 type Config struct {
 	*ini.File
-	Oracle   OracleConfig
-	SMTP     []SMTPConfig
-	Mode     ModeConfig
-	Schedule ScheduleConfig
-	Log      LogConfig
-	Share    ShareConfig
+	Oracle       OracleConfig
+	SMTP         []SMTPConfig
+	Mode         ModeConfig
+	Schedule     ScheduleConfig
+	Log          LogConfig
+	Share        ShareConfig
+	scheduleStop chan struct{} // Канал для остановки горутины обновления расписания
 }
 
 // OracleConfig представляет конфигурацию Oracle
@@ -66,10 +67,12 @@ type LogConfig struct {
 
 // ShareConfig представляет конфигурацию для доступа к CIFS/SMB шарам
 type ShareConfig struct {
-	Username string
-	Password string
-	Domain   string
-	Port     string
+	Username        string
+	Password        string
+	Domain          string
+	Port            string
+	PathReplaceFrom string // Строка для замены в пути (например: "192.168.87.31:shares$:esig_docs")
+	PathReplaceTo   string // Замена на (например: "\\\\sto-s\\Applic\\Xchange\\EDS")
 }
 
 // LoadConfig загружает конфигурацию из INI файла
@@ -251,20 +254,26 @@ func (c *Config) loadScheduleConfig() error {
 	}
 
 	// Обновляем время каждый день
+	c.scheduleStop = make(chan struct{})
 	go func() {
 		ticker := time.NewTicker(1 * time.Hour)
 		defer ticker.Stop()
-		for range ticker.C {
-			now := time.Now()
-			if timeStartStr != "" {
-				timeStart, _ := time.Parse("15:04", timeStartStr)
-				c.Schedule.TimeStart = time.Date(now.Year(), now.Month(), now.Day(),
-					timeStart.Hour(), timeStart.Minute(), 0, 0, now.Location())
-			}
-			if timeEndStr != "" {
-				timeEnd, _ := time.Parse("15:04", timeEndStr)
-				c.Schedule.TimeEnd = time.Date(now.Year(), now.Month(), now.Day(),
-					timeEnd.Hour(), timeEnd.Minute(), 0, 0, now.Location())
+		for {
+			select {
+			case <-c.scheduleStop:
+				return
+			case <-ticker.C:
+				now := time.Now()
+				if timeStartStr != "" {
+					timeStart, _ := time.Parse("15:04", timeStartStr)
+					c.Schedule.TimeStart = time.Date(now.Year(), now.Month(), now.Day(),
+						timeStart.Hour(), timeStart.Minute(), 0, 0, now.Location())
+				}
+				if timeEndStr != "" {
+					timeEnd, _ := time.Parse("15:04", timeEndStr)
+					c.Schedule.TimeEnd = time.Date(now.Year(), now.Month(), now.Day(),
+						timeEnd.Hour(), timeEnd.Minute(), 0, 0, now.Location())
+				}
 			}
 		}
 	}()
@@ -292,6 +301,8 @@ func (c *Config) loadShareConfig() error {
 	c.Share.Password = sec.Key("CIFSPASSWORD").String()
 	c.Share.Domain = sec.Key("CIFSDOMEN").String()
 	c.Share.Port = sec.Key("CIFSPORT").String()
+	c.Share.PathReplaceFrom = sec.Key("PathReplaceFrom").String()
+	c.Share.PathReplaceTo = sec.Key("PathReplaceTo").String()
 
 	// Значение по умолчанию для порта
 	if c.Share.Port == "" {
@@ -299,4 +310,11 @@ func (c *Config) loadShareConfig() error {
 	}
 
 	return nil
+}
+
+// Stop останавливает фоновые горутины Config (для graceful shutdown)
+func (c *Config) Stop() {
+	if c.scheduleStop != nil {
+		close(c.scheduleStop)
+	}
 }

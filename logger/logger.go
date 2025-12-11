@@ -80,18 +80,13 @@ func InitLogger(cfg *ini.File) error {
 	}
 
 	// Настраиваем zap core для записи в файл
-	fileEncoder := zapcore.NewJSONEncoder(zap.NewProductionEncoderConfig())
+	fileEncoderConfig := zap.NewProductionEncoderConfig()
+	fileEncoderConfig.EncodeTime = zapcore.ISO8601TimeEncoder
+	fileEncoder := zapcore.NewJSONEncoder(fileEncoderConfig)
 	fileCore := zapcore.NewCore(fileEncoder, zapcore.AddSync(logWriter), getZapLevel(logLevel))
 
-	// Настраиваем zap core для вывода в консоль (с цветами для удобства)
-	consoleEncoder := zapcore.NewConsoleEncoder(zap.NewDevelopmentEncoderConfig())
-	consoleCore := zapcore.NewCore(consoleEncoder, zapcore.AddSync(os.Stdout), getZapLevel(logLevel))
-
-	// Объединяем оба core
-	core := zapcore.NewTee(fileCore, consoleCore)
-
-	// Создаем логгер
-	Log = zap.New(core, zap.AddCaller(), zap.AddStacktrace(zapcore.ErrorLevel))
+	// Создаем логгер только для записи в файл
+	Log = zap.New(fileCore, zap.AddCaller(), zap.AddStacktrace(zapcore.ErrorLevel))
 
 	Log.Info("Логгер инициализирован",
 		zap.Int("logLevel", int(logLevel)),
@@ -120,4 +115,3 @@ func getZapLevel(level LogLevel) zapcore.Level {
 		return zapcore.DebugLevel // По умолчанию debug
 	}
 }
-

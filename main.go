@@ -48,7 +48,7 @@ func main() {
 	logger.Log.Info("Основной сервис запущен, ожидание сигнала завершения...")
 
 	<-shutdownRequested
-	shutdown(ctx, cancel, mainService, emailService, dbConn, &allHandlersWg)
+	shutdown(ctx, cancel, mainService, emailService, cfg, dbConn, &allHandlersWg)
 }
 
 // initializeConfig загружает конфигурацию и инициализирует логгер
@@ -169,6 +169,7 @@ func shutdown(
 	cancel context.CancelFunc,
 	mainService *service.Service,
 	emailService *email.Service,
+	cfg *settings.Config,
 	dbConn *db.DBConnection,
 	allHandlersWg *sync.WaitGroup,
 ) {
@@ -181,7 +182,7 @@ func shutdown(
 	cancel()
 
 	waitForOperationsCompletion(shutdownCtx, allHandlersWg, dbConn)
-	performGracefulShutdown(shutdownCtx, mainService, emailService, dbConn, allHandlersWg)
+	performGracefulShutdown(shutdownCtx, mainService, emailService, cfg, dbConn, allHandlersWg)
 }
 
 // waitForOperationsCompletion ждет завершения всех операций с таймаутом
@@ -211,6 +212,7 @@ func performGracefulShutdown(
 	ctx context.Context,
 	mainService *service.Service,
 	emailService *email.Service,
+	cfg *settings.Config,
 	dbConn *db.DBConnection,
 	allHandlersWg *sync.WaitGroup,
 ) {
@@ -218,7 +220,7 @@ func performGracefulShutdown(
 
 	waitForActiveDatabaseOperations(ctx, dbConn)
 	waitForMessageHandlers(ctx, allHandlersWg)
-	stopServices(emailService, dbConn)
+	stopServices(emailService, cfg, dbConn)
 
 	logger.Log.Info("Graceful shutdown завершен успешно")
 }
@@ -272,7 +274,10 @@ func waitForMessageHandlers(ctx context.Context, allHandlersWg *sync.WaitGroup) 
 }
 
 // stopServices останавливает все сервисы
-func stopServices(emailService *email.Service, dbConn *db.DBConnection) {
+func stopServices(emailService *email.Service, cfg *settings.Config, dbConn *db.DBConnection) {
+	logger.Log.Info("Остановка горутины обновления расписания...")
+	cfg.Stop()
+
 	logger.Log.Info("Остановка механизма периодического переподключения к БД...")
 	dbConn.StopPeriodicReconnect()
 
