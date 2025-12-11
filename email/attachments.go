@@ -461,14 +461,49 @@ func (p *AttachmentProcessor) processUNCFile(ctx context.Context, attach *Attach
 func (p *AttachmentProcessor) normalizeReportPath(path string) string {
 	// Применяем замену из конфигурации, если задана
 	if p.cfg != nil && p.cfg.Share.PathReplaceFrom != "" && p.cfg.Share.PathReplaceTo != "" {
-		if strings.Contains(path, p.cfg.Share.PathReplaceFrom) {
+		// Нормализуем PathReplaceFrom: если он в формате host:share:path, преобразуем в UNC
+		replaceFrom := p.cfg.Share.PathReplaceFrom
+		if strings.Contains(replaceFrom, ":") && !strings.HasPrefix(replaceFrom, `\\`) && !strings.HasPrefix(replaceFrom, `//`) && !strings.Contains(replaceFrom, `:\`) {
+			// Преобразуем host:share:path в \\host\share\path
+			parts := strings.SplitN(replaceFrom, ":", 3)
+			if len(parts) >= 2 {
+				replaceFrom = `\\` + parts[0] + `\` + parts[1]
+				if len(parts) > 2 {
+					replaceFrom += `\` + parts[2]
+				}
+				// Нормализуем слэши
+				replaceFrom = strings.ReplaceAll(replaceFrom, `/`, `\`)
+			}
+		}
+		
+		// Нормализуем путь для сравнения: преобразуем в UNC формат, если нужно
+		normalizedPath := path
+		if strings.HasPrefix(path, `\\`) || strings.HasPrefix(path, `//`) {
+			// Уже UNC путь, просто нормализуем слэши
+			normalizedPath = strings.ReplaceAll(path, `/`, `\`)
+		} else if strings.Contains(path, ":") && !strings.Contains(path, `:\`) {
+			// Путь в формате host:share:path, преобразуем в UNC для сравнения
+			parts := strings.SplitN(path, ":", 3)
+			if len(parts) >= 2 {
+				normalizedPath = `\\` + parts[0] + `\` + parts[1]
+				if len(parts) > 2 {
+					normalizedPath += `\` + parts[2]
+				}
+				// Нормализуем слэши
+				normalizedPath = strings.ReplaceAll(normalizedPath, `/`, `\`)
+			}
+		}
+		
+		// Проверяем, содержит ли путь заменяемую часть
+		if strings.Contains(normalizedPath, replaceFrom) {
 			originalPath := path
-			path = strings.Replace(path, p.cfg.Share.PathReplaceFrom, p.cfg.Share.PathReplaceTo, 1)
+			path = strings.Replace(normalizedPath, replaceFrom, p.cfg.Share.PathReplaceTo, 1)
 			if logger.Log != nil {
 				logger.Log.Debug("Путь заменён по конфигурации",
 					zap.String("from", originalPath),
 					zap.String("to", path),
 					zap.String("replaceFrom", p.cfg.Share.PathReplaceFrom),
+					zap.String("replaceFromNormalized", replaceFrom),
 					zap.String("replaceTo", p.cfg.Share.PathReplaceTo))
 			}
 		}

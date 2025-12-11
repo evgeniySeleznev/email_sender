@@ -49,3 +49,4 @@ test_data/
 
 Dockerfile
 docker-compose.yml
+compose.yaml

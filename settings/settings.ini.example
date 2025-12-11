@@ -1,62 +1,90 @@
-[ORACLE]
-Instance = your_instance
+# ============================================================================
+# Файл настроек Email Sender - ПРИМЕР
+# Скопируйте этот файл как settings.ini и заполните реальными значениями
+# ============================================================================
 
+# Подключение к Oracle БД: Instance (имя инстанса для определения тестового адреса)
+[ORACLE]
+Instance = YOUR_INSTANCE_NAME
+
+# Подключение к Oracle БД: username, password, dsn (строка подключения в формате TNS),
+# DBConnectRetryAttempts (количество попыток переподключения при старте, по умолчанию 10),
+# DBConnectRetryIntervalSec (интервал между попытками переподключения в секундах, по умолчанию 5)
 [main]
 username = your_username
 password = your_password
-dsn = your_dsn
-# Параметры повторного подключения к БД при старте
+dsn = (DESCRIPTION = (ADDRESS = (PROTOCOL = TCP)(HOST = your_host)(PORT = 1521))(CONNECT_DATA = (SERVER = DEDICATED)(SERVICE_NAME = your_service) ) )
 DBConnectRetryAttempts = 10
 DBConnectRetryIntervalSec = 5
 
+# Очередь Oracle AQ: queue_name (имя очереди), consumer_name (имя потребителя)
 [queue]
 queue_name = askaq.aq_ask
 consumer_name = SUB_EMAIL_SENDER
 
+# Первый SMTP сервер: Host (хост), Port (порт, 465 для SSL), User (логин), Password (пароль),
+# DisplayName (отображаемое имя отправителя), EnableSSL (использование SSL: True/False),
+# MinSendIntervalMsec (минимальный интервал между отправками в мс),
+# SMTPMinSendEmailIntervalMsec (минимальный интервал между письмами на один адрес в мс),
+# IMAPHost/IMAPPort (настройки IMAP для проверки bounce-сообщений об ошибках отправки)
 [SMTP]
-Host = smtp.example.com
-Port = 25
-User = your_email@example.com
-Password = your_password
-DisplayName = Your Display Name
+Host = smtp.your-provider.com
+Port = 465
+User = your_email@provider.com
+Password = your_smtp_password
+DisplayName = Email Sender
 EnableSSL = True
 MinSendIntervalMsec = 1000
 SMTPMinSendEmailIntervalMsec = 1000
-POPHost = pop.example.com
-POPPort = 995
+IMAPHost = imap.your-provider.com
+IMAPPort = 993
 
-#[SMTP1]
-#Host = smtp.example.com
-#Port = 25
-#User = your_email@example.com
-#Password = your_password
-#DisplayName = Your Display Name
-#EnableSSL = True
-#MinSendIntervalMsec = 1000
-#SMTPMinSendEmailIntervalMsec = 1000
-#POPHost = pop.example.com
-#POPPort = 995
+# Второй SMTP сервер по аналогии (резервный)
+[SMTP1]
+Host = smtp.your-provider.com
+Port = 465
+User = your_email@provider.com
+Password = your_smtp_password
+DisplayName = Email Sender
+EnableSSL = True
+MinSendIntervalMsec = 1000
+SMTPMinSendEmailIntervalMsec = 1000
+IMAPHost = imap.your-provider.com
+IMAPPort = 993
 
+# Режимы работы: Debug (отладка, True/False - отправка на тестовый email из БД),
+# SendHiddenCopyToSelf (скрытая копия отправителю, True/False),
+# IsBodyHTML (тело письма в HTML формате, True/False),
+# MaxErrorCountForAutoRestart (максимум ошибок до авто-рестарта),
+# MaxAttachmentSizeMB (максимальный размер вложения к письму в МБ, по умолчанию 100),
+# CrystalReportsTimeoutSec (таймаут для Crystal Reports в секундах, по умолчанию 60)
 [Mode]
 Debug = False
 SendHiddenCopyToSelf = False
-IsBodyHTML = False
+IsBodyHTML = True
 MaxErrorCountForAutoRestart = 50
-# Максимальный размер вложения в МБ (по умолчанию 100)
 MaxAttachmentSizeMB = 100
-# Таймаут для Crystal Reports в секундах (по умолчанию 60)
 CrystalReportsTimeoutSec = 60
 
+# Расписание работы: TimeStart (начало, формат HH:mm), TimeEnd (окончание, формат HH:mm)
 [Schedule]
 TimeStart = 08:00
 TimeEnd = 21:00
 
+# Логирование: LogLevel (0=Panic, 1=Fatal, 2=Error, 3=Warn, 4=Info, 5=Debug),
+# MaxArchiveFiles (максимум архивных логов, каждый не более 100 МБ, удаляются через 10 дней)
 [Log]
-LogLevel = 4
-MaxArchiveFiles = 10
+LogLevel = 5
+MaxArchiveFiles = 20
 
+# Доступ к CIFS/SMB шарам для вложений типа 3: CIFSUSERNAME (логин), CIFSPASSWORD (пароль),
+# CIFSDOMEN (домен), CIFSPORT (порт, обычно 445),
+# PathReplaceFrom/PathReplaceTo (замена пути, если пусто - путь из БД используется как есть)
 [share]
-CIFSUSERNAME = vsaradjev
-CIFSPASSWORD = hUqtev-6xoxce-hyhxyx
+CIFSUSERNAME = your_cifs_username
+CIFSPASSWORD = your_cifs_password
 CIFSDOMEN =
 CIFSPORT = 445
+# Пример: путь из БД "\\192.168.87.31\shares$\esig_docs\OBN\..." -> "\\sto-s\Applic\Xchange\EDS\OBN\..."
+PathReplaceFrom = \\192.168.87.31\shares$\esig_docs
+PathReplaceTo = \\sto-s\Applic\Xchange\EDS
